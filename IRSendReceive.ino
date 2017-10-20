@@ -40,7 +40,7 @@
 
 #include <NTPClient.h>                  // needed for time information
 
-String Version="1.0.1 " + String(__DATE__) + " " + String(__TIME__);
+String Version="1.0.2 " + String(__DATE__) + " " + String(__TIME__);
 
 int port = 80;
 char host_name[40] = "ESP8266IR";
@@ -232,38 +232,9 @@ void handle_json() {
       sendHomePage("JSON parsing failed", "Error", 3, 400); // 400
     }
   } else {
-    // Handle device state limitations for the global JSON command request
-    if (HTTPServer.hasArg("device")) {
-      String device = HTTPServer.arg("device");
-      Serial.println("Device name detected " + device);
-      int state = (HTTPServer.hasArg("state")) ? HTTPServer.arg("state").toInt() : 0;
-      if (deviceState.containsKey(device)) {
-        Serial.println("Contains the key!");
-        Serial.println(state);
-        int currentState = deviceState[device];
-        Serial.println(currentState);
-        if (state == currentState) {
-          if (simple) {
-            HTTPServer.send(200, "text/html", "Not sending command to " + device + ", already in state " + state);
-          } else {
-            sendHomePage("Not sending command to " + device + ", already in state " + state, "Warning", 2); // 200
-          }
-          Serial.println("Not sending command to " + device + ", already in state " + state);
-          return;
-        } else {
-          Serial.println("Setting device " + device + " to state " + state);
-          deviceState[device] = state;
-        }
-      } else {
-        Serial.println("Setting device " + device + " to state " + state);
-        deviceState[device] = state;
-      }
-    }
     if (simple) {
       HTTPServer.send(200, "text/html", "Success, code sent");
     }
-
-    String message = "Code sent";
 
     for (int x = 0; x < root.size(); x++) {
       String type = root[x]["type"];
@@ -277,25 +248,6 @@ void handle_json() {
       if (repeat <= 0) repeat = 1; // Make sure repeat isn't 0
       if (pdelay <= 0) pdelay = 100; // Default pdelay
       if (rdelay <= 0) rdelay = 1000; // Default rdelay
-      // Handle device state limitations on a per JSON object basis
-      String device = root[x]["device"];
-      if (device != "") {
-        int state = root[x]["state"];
-        if (deviceState.containsKey(device)) {
-          int currentState = deviceState[device];
-          if (state == currentState) {
-            Serial.println("Not sending command to " + device + ", already in state " + state);
-            message = "Code sent. Some components of the code were held because device was already in appropriate state";
-            continue;
-          } else {
-            Serial.println("Setting device " + device + " to state " + state);
-            deviceState[device] = state;
-          }
-        } else {
-          Serial.println("Setting device " + device + " to state " + state);
-          deviceState[device] = state;
-        }
-      }
 
       if (type == "delay") {
         delay(rdelay);
@@ -314,7 +266,7 @@ void handle_json() {
 
     if (!simple) {
       Serial.println("Sending home page");
-      sendHomePage(message, "Success", 1); // 200
+      sendHomePage("Code sent", "Success", 1); // 200
     }
   }
 }
@@ -325,21 +277,13 @@ void handle_json() {
 void handleReceived() {
   Serial.println("Connection received");
   int id = HTTPServer.arg("id").toInt();
-  String output;
 
-  if (id == 1 && last_code.containsKey("time")) {
-    sendCodePage(last_code);
-  } else if (id == 2 && last_code_2.containsKey("time")) {
-    sendCodePage(last_code_2);
-  } else if (id == 3 && last_code_3.containsKey("time")) {
-    sendCodePage(last_code_3);
-  } else if (id == 4 && last_code_4.containsKey("time")) {
-    sendCodePage(last_code_4);
-  } else if (id == 5 && last_code_5.containsKey("time")) {
-    sendCodePage(last_code_5);
-  } else {
-    sendHomePage("Code does not exist", "Alert", 2, 404); // 404
-  }
+  if (id == 1 && last_code.containsKey("time"))        sendCodePage(last_code);
+  else if (id == 2 && last_code_2.containsKey("time")) sendCodePage(last_code_2);
+  else if (id == 3 && last_code_3.containsKey("time")) sendCodePage(last_code_3);
+  else if (id == 4 && last_code_4.containsKey("time")) sendCodePage(last_code_4);
+  else if (id == 5 && last_code_5.containsKey("time")) sendCodePage(last_code_5);
+  else sendHomePage("Code does not exist", "Alert", 2, 404); // 404
 }
 
 // ------------------------------------------------------------------------------------------
