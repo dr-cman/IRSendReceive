@@ -24,6 +24,10 @@
 // Huge parts of this program code are taken from the project ESP8266-HTTP-IR-Blaster
 // (https://github.com/mdhiggins/ESP8266-HTTP-IR-Blaster) from Michael Higgins.
 // Thanks for the cool work!
+//
+// Version 1.0.1: initial version
+// Version 1.1.0: status led added (using ticker)
+//
 // *******************************************************************************************
 #include <IRremoteESP8266.h>
 #include <IRsend.h>
@@ -32,6 +36,7 @@
 #include <ESP8266WiFi.h>
 #include <WiFiManager.h>                // https://github.com/tzapu/WiFiManager WiFi Configuration Magic
 #include <ESP8266mDNS.h>                // Useful to access to ESP by hostname.local
+#include <Ticker.h>
 
 #include <ArduinoJson.h>                // json support
 #include <ESP8266WebServer.h>           // needed for web server
@@ -40,7 +45,7 @@
 
 #include <NTPClient.h>                  // needed for time information
 
-String Version="1.0.2 " + String(__DATE__) + " " + String(__TIME__);
+String Version="1.1.0 " + String(__DATE__) + " " + String(__TIME__);
 
 int port = 80;
 char host_name[40] = "ESP8266IR";
@@ -68,8 +73,9 @@ ESP8266HTTPUpdateServer httpUpdater;
 
 bool holdReceive = false;                                     // Flag to prevent IR receiving while transmitting
 
-int pinr = 14;                                               // Receiving pin
-int pins = 4;                                                // Transmitting pin
+int pinr = 14;                                               // Receiving pin (GPIO14 -> D5)
+int pins = 4;                                                // Transmitting pin (GPIO4 -> D2)
+int ledpin = 0;                                              // status LED pin (GPIO0 -> D3)
 
 IRrecv irrecv(pinr);
 IRsend irsend(pins);
@@ -92,6 +98,23 @@ int FhemMsg = 1;                                               // send recieved 
 const char* update_path = "/update";
 const char* update_username = "admin";
 const char* update_password = "cman";
+
+Ticker ticker;
+
+// ------------------------------------------------------------------------------------------
+// Status LED blinking
+// ------------------------------------------------------------------------------------------
+void LEDblink()
+{
+  int state = digitalRead(ledpin);        // get the current state
+  digitalWrite(ledpin, !state);           // toggle state
+}
+
+void LEDoff()
+{
+  digitalWrite(ledpin, LOW);           // toggle state
+  ticker.detach();
+}
 
 // ------------------------------------------------------------------------------------------
 // Reenable IR receiving
@@ -125,6 +148,11 @@ void setup() {
   Serial.println("");
   Serial.printf("ESP8266 IR Controller (Version %s)\n", Version.c_str());
 
+  // set GPIO0 as output (LED)
+  pinMode(ledpin, OUTPUT);
+  digitalWrite(ledpin, LOW);
+  ticker.attach(0.5, LEDblink);
+    
   // establish wlan connection
   wifiManager.autoConnect("ESP8266 IR Controller");
 
@@ -133,6 +161,7 @@ void setup() {
     Serial.print(".");
   }
   Serial.print("\n");
+  LEDoff();
 
   wifi_set_sleep_type(LIGHT_SLEEP_T);
 
@@ -836,6 +865,9 @@ void ToFhem() {
   HTTPClient http;
   String httpCmd;
 
+  digitalWrite(ledpin, HIGH);         // switch on Status LED for two seconds
+  ticker.attach(2, LEDoff);
+  
   httpCmd = "http://" + FhemIP + ":" + FhemPort + "/fhem?cmd.dummy=set%20" + FhemVar + "%20";
 
   if(FhemFmt!="fhem") {
@@ -904,8 +936,8 @@ void loop() {
     last_code["time"] = String(timeClient.getFormattedTime());    // Set the new update time
     irrecv.resume();                                              // Prepare for the next value
 
-    if (FhemMsg)
+    if (FhemMsg)                                                  // if Fhem MEssaging enabled
       ToFhem();                                                   // send to Fhem
   }
-  delay(200);
+  //delay(200);
 }
