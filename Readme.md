@@ -23,7 +23,7 @@
 
 ### Version 1.2.1: bugfix & Status to Fhem added
    - update of forceSend was missing -> T/H always sent to Fhem
-   - ststus information about received/sent and transferred IR commands is sent to Fhem dummy variable for IR commands
+   - status information about received/sent and transferred IR commands is sent to Fhem dummy variable for IR commands
 
 ### http commands
 
