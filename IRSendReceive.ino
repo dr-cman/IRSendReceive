@@ -2,18 +2,39 @@
 // IRSendReceive
 //
 // A program for an ESP8266 board with following functions
+// Version 1.0.1: initial version
 //   - http web interface for sending & receiving IR codes, getting status information
 //     and for system configuration
 //   - network configuration via WiFi manager
-//   - receiving IR codes from IR remote controls via an IR receiver (e.g. TSOP3123) at GPIO14
+//   - receiving IR codes from IR remote controls via an IR receiver (e.g. TSOP3123) at GPIO 14
 //   - sending IR codes using IR transmitter diodes connected to GPIO 4
-//   - forwarding of received IR codes to fhem home automation system via http
+//   - forwarding of received IR codes to Fhem sevrer via http to set a configurable dummy variable
 //   - over the air update (OTA)
+//
+// Version 1.1.0: status led added (using ticker)
+//   - additional status LED connected to GPIO 0. The LED
+//        blinks with 0.5 Hz during connection to WiFi network
+//        is on for 2 seconds when an IR command is sent to Fhem
+//        is on for 1 second whem a Temperature/Humidity value is sent to Fhem (Version >= 1.2.0)
+//
+// Version 1.2.0: DHT22 temperature/humidity sensor added
+//   - DHT22 temperature/humidity sensor connected to GPIO 2 with configurable cyclic readout
+//   - readout values are sent via http to the Fhem server to set a configurable Fhem dummy variable
 //
 // http commands
 //   http://xxx.xxx.xxx.xxx<cmd>
 //   <cmd>
-//   /          Homepage
+//   /          Homepage with status information
+//   /setup     configure IRSendReceive
+//              FhemIP=xxx.xxx.xxx.xxx  IP adress of Fhem server  (default 192.168.2.12)
+//              FhemPort=xxxx           Port number of Fhem server (default 8083)
+//              FhemMsg=[0|1]           Send IR command messages to Fhem (default 1)
+//                                      0=no messages; 1=send messages
+//              FhemFmt=[0|"fhem"]      transfer format of received IR commands (default 1)
+//                                      0 -> json output; "fhem" -> fhem output (default "fhem")
+//              FhemVarIR               Fhem variable to be set with IR command data (default "d_IR")
+//              FhemVarTH               Fhem variable to be set with T/H values (default "d_Temp1")
+//              DHTcycle                cycle time for T/H measurements in ms (default 60000)
 //   /msg       send IR command 
 //   /json      send IR command in json format
 //   /received  retrieve received IR command in json format
@@ -25,14 +46,20 @@
 // (https://github.com/mdhiggins/ESP8266-HTTP-IR-Blaster) from Michael Higgins.
 // Thanks for the cool work!
 //
-// Version 1.0.1: initial version
-// Version 1.1.0: status led added (using ticker)
-//
 // *******************************************************************************************
+
+// IR support
 #include <IRremoteESP8266.h>
 #include <IRsend.h>
 #include <IRrecv.h>
 #include <IRutils.h>
+
+// DHT22 support
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+#include <DHT_U.h>
+
+// WiFi support
 #include <ESP8266WiFi.h>
 #include <WiFiManager.h>                // https://github.com/tzapu/WiFiManager WiFi Configuration Magic
 #include <ESP8266mDNS.h>                // Useful to access to ESP by hostname.local
@@ -45,7 +72,7 @@
 
 #include <NTPClient.h>                  // needed for time information
 
-String Version="1.1.0 " + String(__DATE__) + " " + String(__TIME__);
+String Version="1.2.0 " + String(__DATE__) + " " + String(__TIME__);
 
 int port = 80;
 char host_name[40] = "ESP8266IR";
@@ -68,17 +95,26 @@ JsonObject& last_send_5 = jsonBuffer.createObject();          // Stores 5th last
 JsonObject& deviceState = jsonBuffer.createObject();
 
 ESP8266WebServer HTTPServer(port);
-HTTPClient http;
+//HTTPClient http;
 ESP8266HTTPUpdateServer httpUpdater;
 
 bool holdReceive = false;                                     // Flag to prevent IR receiving while transmitting
 
-int pinr = 14;                                               // Receiving pin (GPIO14 -> D5)
-int pins = 4;                                                // Transmitting pin (GPIO4 -> D2)
-int ledpin = 0;                                              // status LED pin (GPIO0 -> D3)
+// configuration of GPIO pins
+int pinr = 14;                                                // Receiving pin (GPIO14 -> D5)
+int pins = 4;                                                 // Transmitting pin (GPIO4 -> D2)
+int ledpin = 0;                                               // status LED pin (GPIO0 -> D3)
+int dhtpin = 2;                                               // DHT22 sensor pin (GPIO2 -> D4)
 
 IRrecv irrecv(pinr);
 IRsend irsend(pins);
+
+// DHT related variables
+DHT_Unified dht(dhtpin, DHT22);
+static float lastTemp=0;
+static float lastHum=0;
+static unsigned long lastSent=0;
+uint32_t delayMS;
 
 const unsigned long resetfrequency = 259200000;                // 72 hours in milliseconds
 int timeOffset = 7200;                                         // Timezone offset in seconds (MESZ)
@@ -92,14 +128,16 @@ WiFiManager wifiManager;
 String FhemIP   = "192.168.2.12";                              // ip address of fhem system
 String FhemPort = "8083";                                      // port of fhem web server
 String FhemFmt  = "fhem";                                      // output format for fhem message
-String FhemVar  = "d_IR";                                      // name of fhem dummy variable to set
+String FhemVarIR = "d_IR";                                     // name of fhem dummy variable to set
+String FhemVarTH = "d_Temp1";                                  // name of fhem dummy variable to set for temp & humidity
 int FhemMsg = 1;                                               // send recieved IR commands to fhem
+int DHTcycle = 60000;                                          // time between DHT measures in ms
 
 const char* update_path = "/update";
 const char* update_username = "admin";
 const char* update_password = "cman";
 
-Ticker ticker;
+Ticker LEDticker;
 
 // ------------------------------------------------------------------------------------------
 // Status LED blinking
@@ -113,7 +151,39 @@ void LEDblink()
 void LEDoff()
 {
   digitalWrite(ledpin, LOW);           // toggle state
-  ticker.detach();
+  LEDticker.detach();
+}
+
+// ------------------------------------------------------------------------------------------
+// DHT initialization
+// ------------------------------------------------------------------------------------------
+void DHTinit() {
+  dht.begin();
+  
+  // Print temperature sensor details.
+  sensor_t sensor;
+  dht.temperature().getSensor(&sensor);
+  Serial.println("");
+  Serial.print  ("[INIT ] Temperature Sensor: "); Serial.println(sensor.name);
+  Serial.print  ("[INIT ] Driver Version:     "); Serial.println(sensor.version);
+  Serial.print  ("[INIT ] Unique ID:          "); Serial.println(sensor.sensor_id);
+  Serial.print  ("[INIT ] Max Value:          "); Serial.print(sensor.max_value); Serial.println(" *C");
+  Serial.print  ("[INIT ] Min Value:          "); Serial.print(sensor.min_value); Serial.println(" *C");
+  Serial.print  ("[INIT ] Resolution:         "); Serial.print(sensor.resolution); Serial.println(" *C");  
+  Serial.println("");
+
+  // Print humidity sensor details.
+  dht.humidity().getSensor(&sensor);
+  Serial.print  ("[INIT ] Humidity Sensor:    "); Serial.println(sensor.name);
+  Serial.print  ("[INIT ] Driver Version:     "); Serial.println(sensor.version);
+  Serial.print  ("[INIT ] Unique ID:          "); Serial.println(sensor.sensor_id);
+  Serial.print  ("[INIT ] Max Value:          "); Serial.print(sensor.max_value); Serial.println("%");
+  Serial.print  ("[INIT ] Min Value:          "); Serial.print(sensor.min_value); Serial.println("%");
+  Serial.print  ("[INIT ] Resolution:         "); Serial.print(sensor.resolution); Serial.println("%");  
+  Serial.println("");
+  
+  // Set delay between sensor readings based on sensor details.
+  delayMS = sensor.min_delay / 1000;
 }
 
 // ------------------------------------------------------------------------------------------
@@ -145,13 +215,15 @@ void setup() {
 
   // Initialize serial
   Serial.begin(115200);
+  delay(1000);
   Serial.println("");
   Serial.printf("ESP8266 IR Controller (Version %s)\n", Version.c_str());
-
+  delay(1000);
+  
   // set GPIO0 as output (LED)
   pinMode(ledpin, OUTPUT);
   digitalWrite(ledpin, LOW);
-  ticker.attach(0.5, LEDblink);
+  LEDticker.attach(0.5, LEDblink);
     
   // establish wlan connection
   wifiManager.autoConnect("ESP8266 IR Controller");
@@ -165,7 +237,7 @@ void setup() {
 
   wifi_set_sleep_type(LIGHT_SLEEP_T);
 
-  Serial.print("Local IP: ");
+  Serial.print("[INIT ] Local IP: ");
   Serial.println(ipToString(WiFi.localIP()));
 
   if (getTime) timeClient.begin(); // Get the time
@@ -176,7 +248,7 @@ void setup() {
   HTTPServer.on("/received", handleReceived);
   HTTPServer.on("/setup", handle_setup);
   HTTPServer.on("/", []() {
-    Serial.println("Connection received - root");
+    Serial.println("[HTTP ] Connection received: /");
     sendHomePage(); // 200
   });
 
@@ -184,19 +256,22 @@ void setup() {
 
   httpUpdater.setup(&HTTPServer, update_path, update_username, update_password);
   HTTPServer.begin();
-  Serial.println("HTTP Server started on port " + String(port));
+  Serial.println("[INIT ] HTTP Server started on port " + String(port));
   MDNS.addService("http", "tcp", 80);
 
   irsend.begin();
   irrecv.enableIRIn();
-  Serial.println("Ready to send and receive IR signals");
+  Serial.println("[INIT ] Ready to send and receive IR signals");
+
+  // init DHT sensor 
+  DHTinit();
 }
 
 // ------------------------------------------------------------------------------------------
 // handle msg
 // ------------------------------------------------------------------------------------------
 void handle_msg() {
-  Serial.println("Connection received - msg");
+  Serial.println("[HTTP ] Connection received: /msg");
   int simple = 0;
   if (HTTPServer.hasArg("simple")) simple = HTTPServer.arg("simple").toInt();
   String type = HTTPServer.arg("type");
@@ -208,7 +283,7 @@ void handle_msg() {
   int pulse = (HTTPServer.hasArg("pulse")) ? HTTPServer.arg("pulse").toInt() : 1;
   int pdelay = (HTTPServer.hasArg("pdelay")) ? HTTPServer.arg("pdelay").toInt() : 100;
   int repeat = (HTTPServer.hasArg("repeat")) ? HTTPServer.arg("repeat").toInt() : 1;
-  int out = (HTTPServer.hasArg("out")) ? HTTPServer.arg("out").toInt() : 0;
+  //int out = (HTTPServer.hasArg("out")) ? HTTPServer.arg("out").toInt() : 0;
 
   if (HTTPServer.hasArg("code")) {
     String code = HTTPServer.arg("code");
@@ -233,12 +308,14 @@ void handle_msg() {
 // handle setup
 // ------------------------------------------------------------------------------------------
 void handle_setup() {
-  Serial.println("Connection received - setup");
-  FhemIP  = (HTTPServer.hasArg("ip")) ? HTTPServer.arg("ip") : "192.168.2.12";
-  FhemPort= (HTTPServer.hasArg("port")) ? HTTPServer.arg("port") : "8083";
-  FhemMsg = (HTTPServer.hasArg("message")) ? HTTPServer.arg("message").toInt() : 0;
-  FhemFmt = (HTTPServer.hasArg("format")) ? HTTPServer.arg("format") : "fhem";
-  FhemVar = (HTTPServer.hasArg("variable")) ? HTTPServer.arg("variable") : "d_IR";
+  Serial.println("[HTTP ] Connection received: /setup");
+  FhemIP    = (HTTPServer.hasArg("FhemIp"))    ? HTTPServer.arg("FhemIp")           : FhemIP;
+  FhemPort  = (HTTPServer.hasArg("FhemPort"))  ? HTTPServer.arg("FhemPort")         : FhemPort;
+  FhemMsg   = (HTTPServer.hasArg("FhemMsg"))   ? HTTPServer.arg("FhemMsg").toInt()  : FhemMsg;
+  FhemFmt   = (HTTPServer.hasArg("FhemFmt"))   ? HTTPServer.arg("FhemFmt")          : FhemFmt;
+  FhemVarIR = (HTTPServer.hasArg("FhemVarIR")) ? HTTPServer.arg("FhemVarIR")        : FhemVarIR;
+  FhemVarTH = (HTTPServer.hasArg("FhemVarTH")) ? HTTPServer.arg("FhemVarTH")        : FhemVarTH;
+  DHTcycle  = (HTTPServer.hasArg("DHTcycle"))  ? HTTPServer.arg("DHTcycle").toInt() : DHTcycle;
   sendHomePage(); // 200
 }
 
@@ -246,7 +323,7 @@ void handle_setup() {
 // handle json
 // ------------------------------------------------------------------------------------------
 void handle_json() {
-  Serial.println("Connection received - json");
+  Serial.println("[HTTP ] Connection received: /json");
   DynamicJsonBuffer jsonBuffer;
   JsonArray& root = jsonBuffer.parseArray(HTTPServer.arg("plain"));
 
@@ -254,7 +331,7 @@ void handle_json() {
   if (HTTPServer.hasArg("simple")) simple = HTTPServer.arg("simple").toInt();
 
   if (!root.success()) {
-    Serial.println("JSON parsing failed");
+    Serial.println("[HTTP ] JSON parsing failed");
     if (simple) {
       HTTPServer.send(400, "text/plain", "JSON parsing failed");
     } else {
@@ -265,14 +342,14 @@ void handle_json() {
       HTTPServer.send(200, "text/html", "Success, code sent");
     }
 
-    for (int x = 0; x < root.size(); x++) {
+    for (unsigned int x = 0; x < root.size(); x++) {
       String type = root[x]["type"];
       String ip = root[x]["ip"];
       int rdelay = root[x]["rdelay"];
       int pulse = root[x]["pulse"];
       int pdelay = root[x]["pdelay"];
       int repeat = root[x]["repeat"];
-      int out = root[x]["out"];
+      //int out = root[x]["out"];
       if (pulse <= 0) pulse = 1; // Make sure pulse isn't 0
       if (repeat <= 0) repeat = 1; // Make sure repeat isn't 0
       if (pdelay <= 0) pdelay = 100; // Default pdelay
@@ -294,7 +371,7 @@ void handle_json() {
     }
 
     if (!simple) {
-      Serial.println("Sending home page");
+      Serial.println("[HTTP ] Sending home page");
       sendHomePage("Code sent", "Success", 1); // 200
     }
   }
@@ -304,7 +381,7 @@ void handle_json() {
 // handle received
 // ------------------------------------------------------------------------------------------
 void handleReceived() {
-  Serial.println("Connection received");
+  Serial.println("[HTTP ] Connection received: /received");
   int id = HTTPServer.arg("id").toInt();
 
   if (id == 1 && last_code.containsKey("time"))        sendCodePage(last_code);
@@ -362,7 +439,7 @@ String encoding(decode_results *results) {
     case COOLIX:       output = "COOLIX";             break;
   }
   return output;
-  if (results->repeat) Serial.print(" (Repeat)");
+  if (results->repeat) Serial.print("[IR   ] (Repeat)");
 }
 
 // ------------------------------------------------------------------------------------------
@@ -393,14 +470,14 @@ String Uint64toString(uint64_t input, uint8_t base) {
 // ------------------------------------------------------------------------------------------
 void fullCode (decode_results *results)
 {
-  Serial.print("One line: ");
+  Serial.print("[IR   ] One line: ");
   serialPrintUint64(results->value, 16);
   Serial.print(":");
   Serial.print(encoding(results));
   Serial.print(":");
   Serial.print(results->bits, DEC);
   if (results->overflow)
-    Serial.println("WARNING: IR code too long."
+    Serial.println("[IR   ] WARNING: IR code too long."
                    "Edit IRrecv.h and increase RAWBUF");
   Serial.println("");
 }
@@ -425,7 +502,7 @@ void sendHeader(int httpcode) {
   HTTPServer.sendContent("  </head>\n");
   HTTPServer.sendContent("  <body>\n");
   HTTPServer.sendContent("    <div class='container'>\n");
-  HTTPServer.sendContent("      <h1><a href='https://github.com/mdhiggins/ESP8266-HTTP-IR-Blaster'>ESP8266 IR Controller</a></h1>\n");
+  HTTPServer.sendContent("      <h1><a href='https://github.com/dr-cman/IRSendReceive'>ESP8266 IR Controller</a></h1>\n");
   HTTPServer.sendContent("      <div class='row'>\n");
   HTTPServer.sendContent("        <div class='col-md-12'>\n");
   HTTPServer.sendContent("          <ul class='nav nav-pills'>\n");
@@ -520,9 +597,11 @@ void sendHomePage(String message, String header, int type, int httpcode) {
   HTTPServer.sendContent("            <li> Receiving GPIO <span class='badge'>" + String(pinr) + "</span></li>\n");
   HTTPServer.sendContent("            <li> Transmitting GPIO <span class='badge'>" + String(pins) + "</span></li>\n");
   HTTPServer.sendContent("            <li> FhemMsg <span class='badge'>" + String(FhemMsg) + "</span></li>\n");
-  HTTPServer.sendContent("            <li> FhemIP <span class='badge'>" + String(FhemIP) + ":" + String(FhemPort) + "</span></li>\n");
-  HTTPServer.sendContent("            <li> FhemVar <span class='badge'>" + String(FhemVar) + "</span></li>\n");
+  HTTPServer.sendContent("            <li> FhemIP:FhemPort <span class='badge'>" + String(FhemIP) + ":" + String(FhemPort) + "</span></li>\n");
+  HTTPServer.sendContent("            <li> FhemVarIR <span class='badge'>" + String(FhemVarIR) + "</span></li>\n");
+  HTTPServer.sendContent("            <li> FhemVarTH <span class='badge'>" + String(FhemVarTH) + "</span></li>\n");
   HTTPServer.sendContent("            <li> FhemFmt <span class='badge'>" + String(FhemFmt) + "</span></li>\n");
+  HTTPServer.sendContent("            <li> DHTcycle <span class='badge'>" + String(DHTcycle) + "</span></li>\n");
   HTTPServer.sendContent("        </div>\n");
   HTTPServer.sendContent("      </div>\n");
   sendFooter();
@@ -610,16 +689,16 @@ void codeJson(JsonObject &codeData, decode_results *results)
 // ------------------------------------------------------------------------------------------
 void dumpInfo(decode_results *results) {
   if (results->overflow)
-    Serial.println("WARNING: IR code too long."
+    Serial.println("[IR   ] WARNING: IR code too long."
                    "Edit IRrecv.h and increase RAWBUF");
 
   // Show Encoding standard
-  Serial.print("Encoding  : ");
+  Serial.print("[IR   ] Encoding  : ");
   Serial.print(encoding(results));
   Serial.println("");
 
   // Show Code & length
-  Serial.print("Code      : ");
+  Serial.print("[IR   ] Code      : ");
   serialPrintUint64(results->value, 16);
   Serial.print(" (");
   Serial.print(results->bits, DEC);
@@ -631,7 +710,7 @@ void dumpInfo(decode_results *results) {
 // ------------------------------------------------------------------------------------------
 void dumpRaw(decode_results *results) {
   // Print Raw data
-  Serial.print("Timing[");
+  Serial.print("[IR   ] Timing[");
   Serial.print(results->rawlen - 1, DEC);
   Serial.println("]: ");
 
@@ -663,7 +742,7 @@ void dumpRaw(decode_results *results) {
 // ------------------------------------------------------------------------------------------
 void dumpCode(decode_results *results) {
   // Start declaration
-  Serial.print("uint16_t  ");              // variable type
+  Serial.print("[IR   ] uint16_t  ");              // variable type
   Serial.print("rawData[");                // array name
   Serial.print(results->rawlen - 1, DEC);  // array size
   Serial.print("] = {");                   // Start declaration
@@ -694,16 +773,16 @@ void dumpCode(decode_results *results) {
     // NOTE: It will ignore the atypical case when a message has been decoded
     // but the address & the command are both 0.
     if (results->address > 0 || results->command > 0) {
-      Serial.print("uint32_t  address = 0x");
+      Serial.print("[IR   ] uint32_t  address = 0x");
       Serial.print(results->address, HEX);
       Serial.println(";");
-      Serial.print("uint32_t  command = 0x");
+      Serial.print("[IR   ] uint32_t  command = 0x");
       Serial.print(results->command, HEX);
       Serial.println(";");
     }
 
     // All protocols have data
-    Serial.print("uint64_t  data = 0x");
+    Serial.print("[IR   ] uint64_t  data = 0x");
     serialPrintUint64(results->value, 16);
     Serial.println(";");
   }
@@ -741,11 +820,11 @@ unsigned long HexToLongInt(String h)
 // ------------------------------------------------------------------------------------------
 void irblast(String type, String dataStr, unsigned int len, int rdelay, int pulse,
              int pdelay, int repeat, long address, IRsend irsend) {
-  Serial.println("Blasting off");
+  Serial.println("[IR   ] Blasting off");
   type.toLowerCase();
   unsigned long data = HexToLongInt(dataStr);
   holdReceive = true;
-  Serial.println("Blocking incoming IR signals");
+  Serial.println("[IR   ] Blocking incoming IR signals");
   // Repeat Loop
   for (int r = 0; r < repeat; r++) {
     // Pulse Loop
@@ -776,7 +855,7 @@ void irblast(String type, String dataStr, unsigned int len, int rdelay, int puls
     if (r + 1 < rdelay) delay(rdelay);
   }
 
-  Serial.println("Transmission complete");
+  Serial.println("[IR   ] Transmission complete");
 
   copyJsonSend(last_send_4, last_send_5);
   copyJsonSend(last_send_3, last_send_4);
@@ -796,14 +875,14 @@ void irblast(String type, String dataStr, unsigned int len, int rdelay, int puls
 // send IR raw code  
 // ------------------------------------------------------------------------------------------
 void rawblast(JsonArray &raw, int khz, int rdelay, int pulse, int pdelay, int repeat, IRsend irsend) {
-  Serial.println("Raw transmit");
+  Serial.println("[IR   ] Raw transmit");
   holdReceive = true;
-  Serial.println("Blocking incoming IR signals");
+  Serial.println("[IR   ] Blocking incoming IR signals");
   // Repeat Loop
   for (int r = 0; r < repeat; r++) {
     // Pulse Loop
     for (int p = 0; p < pulse; p++) {
-      Serial.println("Sending code");
+      Serial.println("[IR   ] Sending code");
       irsend.enableIROut(khz);
       for (unsigned int i = 0; i < raw.size(); i++) {
         int val = raw[i];
@@ -816,7 +895,7 @@ void rawblast(JsonArray &raw, int khz, int rdelay, int pulse, int pdelay, int re
     if (r + 1 < rdelay) delay(rdelay);
   }
 
-  Serial.println("Transmission complete");
+  Serial.println("[IR   ] Transmission complete");
 
   copyJsonSend(last_send_4, last_send_5);
   copyJsonSend(last_send_3, last_send_4);
@@ -861,14 +940,13 @@ void copyJsonSend(JsonObject& j1, JsonObject& j2) {
 // ------------------------------------------------------------------------------------------
 // send IR code info via http to a fhem web server
 // ------------------------------------------------------------------------------------------
-void ToFhem() {
-  HTTPClient http;
+void IRtoFhem() {
   String httpCmd;
 
   digitalWrite(ledpin, HIGH);         // switch on Status LED for two seconds
-  ticker.attach(2, LEDoff);
+  LEDticker.attach(2, LEDoff);
   
-  httpCmd = "http://" + FhemIP + ":" + FhemPort + "/fhem?cmd.dummy=set%20" + FhemVar + "%20";
+  httpCmd = "http://" + FhemIP + ":" + FhemPort + "/fhem?cmd.dummy=set%20" + FhemVarIR + "%20";
 
   if(FhemFmt!="fhem") {
     httpCmd += "[{";
@@ -900,7 +978,84 @@ void ToFhem() {
     }
   }
 
-  Serial.printf("to Fhem: %s\n", httpCmd.c_str());
+  Serial.printf("[HTTP ] IRtoFhem: %s\n", httpCmd.c_str());
+  SendHttpCmd(httpCmd);
+}
+
+// ------------------------------------------------------------------------------------------
+// send temperature & humidity to a fhem web server
+// ------------------------------------------------------------------------------------------
+void DHTtoFhem() {
+  bool error=false;
+  bool forceSend=false;
+  float Temperature=0.0;
+  float Humidity=0.0;
+  char sHum[10];
+  char sTemp[10];
+  String httpCmd;
+  unsigned long Now=millis();
+
+  // init result values
+  sprintf(sHum, "-");
+  sprintf(sTemp, "-");
+
+  // Get temperature event and save its value.
+  sensors_event_t event;  
+  dht.temperature().getEvent(&event);
+  if (isnan(event.temperature)) {
+    Serial.println("[DHT22] Error reading temperature!");
+    error=true;
+  }
+  else {
+    Serial.print("[DHT22] Temperature: ");
+    Serial.print(event.temperature);
+    Serial.println("*C");
+    Temperature=(float)event.temperature;
+    dtostrf(Temperature, 5, 2, sTemp);
+  }
+  
+  // Get humidity event and save its value.
+  dht.humidity().getEvent(&event);
+  if (isnan(event.relative_humidity)) {
+    Serial.println("[DHT22] Error reading humidity!");
+    error=true;
+  }
+  else {
+    Serial.print("[DHT22] Humidity   : ");
+    Serial.print(event.relative_humidity);
+    Serial.println("%");
+    Humidity=(float)event.relative_humidity;
+    dtostrf(Humidity, 5, 2, sHum);
+  }
+
+  if(Now-lastSent>(unsigned long)600000)
+    // 10 minutes no change in values --> force send
+    forceSend=true;
+  
+  if(error || forceSend || abs(lastHum-Humidity)>0.5 || abs(lastTemp-Temperature)>0.2) { 
+    if(!error) {
+      lastHum=Humidity;
+      lastTemp=Temperature;
+    }
+      
+    digitalWrite(ledpin, HIGH);         // switch on Status LED for one second
+    LEDticker.attach(1, LEDoff);
+
+    httpCmd = "http://" + FhemIP + ":" + FhemPort + "/fhem?cmd.dummy=set%20" + FhemVarTH + "%20";
+    httpCmd += "T:%20" + String(sTemp) + "%20H:%20" + String(sHum) + "&XHR=1";
+    
+    Serial.printf("[HTTP ] DHTtoFhem: %s\n", httpCmd.c_str());
+    SendHttpCmd(httpCmd);
+  } 
+  else 
+    Serial.printf("[DHT22] no change in values --> nothing to transmit\n");  
+}
+// ------------------------------------------------------------------------------------------
+// send HTTP command
+// ------------------------------------------------------------------------------------------
+void SendHttpCmd(String httpCmd) {
+  // configure traged server and url
+  HTTPClient http;
 
   http.begin(httpCmd); //HTTP
   int httpCode = http.GET();
@@ -908,9 +1063,9 @@ void ToFhem() {
   // httpCode will be negative on error
   if (httpCode > 0) {
     // HTTP header has been send and Server response header has been handled
-    Serial.printf("[HTTP] GET... code: %d\n", httpCode);
+    Serial.printf("[HTTP ] GET... code: %d\n", httpCode);
   } else {
-    Serial.printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
+    Serial.printf("[HTTP ] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
   }
   http.end();
 }
@@ -920,12 +1075,13 @@ void ToFhem() {
 // ------------------------------------------------------------------------------------------
 void loop() {
   String tmp;
+  static unsigned long DHTlastSent=0;
   HTTPServer.handleClient();
   decode_results  results;                                        // Somewhere to store the results
   if (getTime) timeClient.update();                               // Update the time
 
   if (irrecv.decode(&results) && !holdReceive) {                  // Grab an IR code
-    Serial.println("Signal received:");
+    Serial.println("[IR   ] Signal received:");
     fullCode(&results);                                           // Print the singleline value
     dumpCode(&results);                                           // Output the results as source code
     copyJson(last_code_4, last_code_5);                           // Pass
@@ -936,8 +1092,17 @@ void loop() {
     last_code["time"] = String(timeClient.getFormattedTime());    // Set the new update time
     irrecv.resume();                                              // Prepare for the next value
 
-    if (FhemMsg)                                                  // if Fhem MEssaging enabled
-      ToFhem();                                                   // send to Fhem
+    if (FhemMsg) {                                                // if Fhem Messaging enabled
+      if(last_code["encoding"].as<String>()!="UNKNOWN")           // reasonable IR code
+        IRtoFhem();                                               // --> send to Fhem
+      else                                                        // skip otherwise
+        Serial.println("[IR   ] UNKNOWN code --> no message to Fhem");
+    }
   }
-  //delay(200);
+
+  unsigned long Now=millis();       
+  if(Now-DHTlastSent>(unsigned long)DHTcycle) {                   // readout DHT sensor if cycle time is over
+    DHTtoFhem();
+    DHTlastSent=Now;
+  }
 }
