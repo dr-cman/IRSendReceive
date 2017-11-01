@@ -27,23 +27,26 @@
 
 ### http commands
 
-   /         Homepage with status information
-   /setup    configure IRSendReceive
-             FhemIP=xxx.xxx.xxx.xxx  IP adress of Fhem server  (default 192.168.2.12)
-             FhemPort=xxxx           Port number of Fhem server (default 8083)
-             FhemMsg=[0|1]           Send IR command messages to Fhem (default 1)
-                                     0=no messages; 1=send messages
-             FhemFmt=[0|"fhem"]      transfer format of received IR commands (default 1)
-                                     0 -> json output; "fhem" -> fhem output (default "fhem")
-             FhemVarIR               Fhem variable to be set with IR command data (default "d_IR")
-             FhemVarTH               Fhem variable to be set with T/H values (default "d_Temp1")
-             DHTcycle                cycle time for T/H measurements in ms (default 60000)
-   /msg      send IR command 
-   /json     send IR command in json format
-   /received retrieve received IR command in json format
-             Arguments:  
-             &id=n n=[1..5]   retrieve details of lan n-th received code
-   /update   start OTY firmware update
+     http://xxx.xxx.xxx.xxx<cmd>
+
+     <cmd>
+     /         Homepage with status information
+     /setup    configure IRSendReceive
+               FhemIP=xxx.xxx.xxx.xxx  IP adress of Fhem server  (default 192.168.2.12)
+               FhemPort=xxxx           Port number of Fhem server (default 8083)
+               FhemMsg=[0|1]           Send IR command messages to Fhem (default 1)
+                                       0=no messages; 1=send messages
+               FhemFmt=[0|"fhem"]      transfer format of received IR commands (default 1)
+                                       0 -> json output; "fhem" -> fhem output (default "fhem")
+               FhemVarIR               Fhem variable to be set with IR command data (default "d_IR")
+               FhemVarTH               Fhem variable to be set with T/H values (default "d_Temp1")
+               DHTcycle                cycle time for T/H measurements in ms (default 60000)
+     /msg      send IR command 
+     /json     send IR command in json format
+     /received retrieve received IR command in json format
+               Arguments:  
+               &id=n n=[1..5]   retrieve details of lan n-th received code
+     /update   start OTY firmware update
  
  Huge parts of this program code are taken from the project ESP8266-HTTP-IR-Blaster
  (https:github.com/mdhiggins/ESP8266-HTTP-IR-Blaster) from Michael Higgins.
