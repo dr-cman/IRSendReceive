@@ -21,6 +21,10 @@
 //   - DHT22 temperature/humidity sensor connected to GPIO 2 with configurable cyclic readout
 //   - readout values are sent via http to the Fhem server to set a configurable Fhem dummy variable
 //
+// Version 1.2.1: bugfix & Status to Fhem added
+//   - update of forceSend was missing -> T/H always sent to Fhem
+//   - ststus information about received/sent and transferred IR commands is sent to Fhem dummy variable for IR commands
+//
 // http commands
 //   http://xxx.xxx.xxx.xxx<cmd>
 //   <cmd>
@@ -72,7 +76,7 @@
 
 #include <NTPClient.h>                  // needed for time information
 
-String Version="1.2.0 " + String(__DATE__) + " " + String(__TIME__);
+String Version="1.2.1 " + String(__DATE__) + " " + String(__TIME__);
 
 int port = 80;
 char host_name[40] = "ESP8266IR";
@@ -95,7 +99,6 @@ JsonObject& last_send_5 = jsonBuffer.createObject();          // Stores 5th last
 JsonObject& deviceState = jsonBuffer.createObject();
 
 ESP8266WebServer HTTPServer(port);
-//HTTPClient http;
 ESP8266HTTPUpdateServer httpUpdater;
 
 bool holdReceive = false;                                     // Flag to prevent IR receiving while transmitting
@@ -132,10 +135,16 @@ String FhemVarIR = "d_IR";                                     // name of fhem d
 String FhemVarTH = "d_Temp1";                                  // name of fhem dummy variable to set for temp & humidity
 int FhemMsg = 1;                                               // send recieved IR commands to fhem
 int DHTcycle = 60000;                                          // time between DHT measures in ms
+int STATUScycle = 600000;                                      // time between status messages in ms
 
+// OTA related settings
 const char* update_path = "/update";
 const char* update_username = "admin";
 const char* update_password = "cman";
+
+int CountIRreceived=0;
+int CountIRsent=0;
+int CountIRtransferred=0;
 
 Ticker LEDticker;
 
@@ -247,6 +256,10 @@ void setup() {
   HTTPServer.on("/msg", handle_msg);
   HTTPServer.on("/received", handleReceived);
   HTTPServer.on("/setup", handle_setup);
+  HTTPServer.on("/reset", []() {
+    Serial.println("[HTTP ] Connection received: /reset");
+    ESP.reset();
+  });
   HTTPServer.on("/", []() {
     Serial.println("[HTTP ] Connection received: /");
     sendHomePage(); // 200
@@ -283,7 +296,6 @@ void handle_msg() {
   int pulse = (HTTPServer.hasArg("pulse")) ? HTTPServer.arg("pulse").toInt() : 1;
   int pdelay = (HTTPServer.hasArg("pdelay")) ? HTTPServer.arg("pdelay").toInt() : 100;
   int repeat = (HTTPServer.hasArg("repeat")) ? HTTPServer.arg("repeat").toInt() : 1;
-  //int out = (HTTPServer.hasArg("out")) ? HTTPServer.arg("out").toInt() : 0;
 
   if (HTTPServer.hasArg("code")) {
     String code = HTTPServer.arg("code");
@@ -855,6 +867,7 @@ void irblast(String type, String dataStr, unsigned int len, int rdelay, int puls
     if (r + 1 < rdelay) delay(rdelay);
   }
 
+  CountIRsent++;
   Serial.println("[IR   ] Transmission complete");
 
   copyJsonSend(last_send_4, last_send_5);
@@ -895,6 +908,7 @@ void rawblast(JsonArray &raw, int khz, int rdelay, int pulse, int pdelay, int re
     if (r + 1 < rdelay) delay(rdelay);
   }
 
+  CountIRsent++;
   Serial.println("[IR   ] Transmission complete");
 
   copyJsonSend(last_send_4, last_send_5);
@@ -1046,10 +1060,25 @@ void DHTtoFhem() {
     
     Serial.printf("[HTTP ] DHTtoFhem: %s\n", httpCmd.c_str());
     SendHttpCmd(httpCmd);
+    lastSent=Now;
   } 
   else 
     Serial.printf("[DHT22] no change in values --> nothing to transmit\n");  
 }
+
+// ------------------------------------------------------------------------------------------
+// send status info to fhem web server
+// ------------------------------------------------------------------------------------------
+void STATUStoFhem() {
+  String httpCmd;
+
+  httpCmd = "http://" + FhemIP + ":" + FhemPort + "/fhem?cmd.dummy=set%20" + FhemVarIR + "%20";
+  httpCmd += "IRsent:%20" + String(CountIRsent) + "%20IRreceived:%20" + String(CountIRreceived) + "%20";
+  httpCmd += "IRtoFhem:%20" + String(CountIRtransferred) + "&XHR=1";
+  Serial.printf("[HTTP ] STATUStoFhem: %s\n", httpCmd.c_str());
+  SendHttpCmd(httpCmd);
+}
+
 // ------------------------------------------------------------------------------------------
 // send HTTP command
 // ------------------------------------------------------------------------------------------
@@ -1075,12 +1104,14 @@ void SendHttpCmd(String httpCmd) {
 // ------------------------------------------------------------------------------------------
 void loop() {
   String tmp;
-  static unsigned long DHTlastSent=0;
+  static unsigned long DHTlastReadout=0;
+  static unsigned long STATUSlastSent=0;
   HTTPServer.handleClient();
   decode_results  results;                                        // Somewhere to store the results
   if (getTime) timeClient.update();                               // Update the time
 
   if (irrecv.decode(&results) && !holdReceive) {                  // Grab an IR code
+    CountIRreceived++;
     Serial.println("[IR   ] Signal received:");
     fullCode(&results);                                           // Print the singleline value
     dumpCode(&results);                                           // Output the results as source code
@@ -1093,16 +1124,25 @@ void loop() {
     irrecv.resume();                                              // Prepare for the next value
 
     if (FhemMsg) {                                                // if Fhem Messaging enabled
-      if(last_code["encoding"].as<String>()!="UNKNOWN")           // reasonable IR code
+      if(last_code["encoding"].as<String>()!="UNKNOWN") {         // reasonable IR code
+        CountIRtransferred++;
         IRtoFhem();                                               // --> send to Fhem
+      }
       else                                                        // skip otherwise
         Serial.println("[IR   ] UNKNOWN code --> no message to Fhem");
     }
   }
 
   unsigned long Now=millis();       
-  if(Now-DHTlastSent>(unsigned long)DHTcycle) {                   // readout DHT sensor if cycle time is over
+  if(Now-DHTlastReadout>(unsigned long)DHTcycle || DHTlastReadout==0) {                
+    // readout DHT sensor if cycle time is over (or never sent before)
     DHTtoFhem();
-    DHTlastSent=Now;
+    DHTlastReadout=Now;
+  }
+
+  if(Now-STATUSlastSent>(unsigned long)STATUScycle || STATUSlastSent==0) {
+    // send STATUS info if cycle time is over (or never sent before)
+    STATUStoFhem();
+    STATUSlastSent=Now;
   }
 }
