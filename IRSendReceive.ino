@@ -76,7 +76,7 @@
 
 #include <NTPClient.h>                  // needed for time information
 
-String Version="1.2.1 " + String(__DATE__) + " " + String(__TIME__);
+String IRVersion="1.2.2 " + String(__DATE__) + " " + String(__TIME__);
 
 int port = 80;
 char host_name[40] = "ESP8266IR";
@@ -85,16 +85,20 @@ char port_str[20] = "80";
 DynamicJsonBuffer jsonBuffer;
 
 JsonObject& last_code = jsonBuffer.createObject();            // Stores last code
+/*
 JsonObject& last_code_2 = jsonBuffer.createObject();          // Stores 2nd to last code
 JsonObject& last_code_3 = jsonBuffer.createObject();          // Stores 3rd to last code
 JsonObject& last_code_4 = jsonBuffer.createObject();          // Stores 4th to last code
 JsonObject& last_code_5 = jsonBuffer.createObject();          // Stores 5th to last code
+*/
 
 JsonObject& last_send = jsonBuffer.createObject();            // Stores last sent
+/*
 JsonObject& last_send_2 = jsonBuffer.createObject();          // Stores 2nd last sent
 JsonObject& last_send_3 = jsonBuffer.createObject();          // Stores 3rd last sent
 JsonObject& last_send_4 = jsonBuffer.createObject();          // Stores 4th last sent
 JsonObject& last_send_5 = jsonBuffer.createObject();          // Stores 5th last sent
+*/
 
 JsonObject& deviceState = jsonBuffer.createObject();
 
@@ -106,7 +110,7 @@ bool holdReceive = false;                                     // Flag to prevent
 // configuration of GPIO pins
 int pinr = 14;                                                // Receiving pin (GPIO14 -> D5)
 int pins = 4;                                                 // Transmitting pin (GPIO4 -> D2)
-int ledpin = 0;                                               // status LED pin (GPIO0 -> D3)
+int ledpin = 12;                                              // status LED pin (GPIO0 -> D6)
 int dhtpin = 2;                                               // DHT22 sensor pin (GPIO2 -> D4)
 
 IRrecv irrecv(pinr);
@@ -132,7 +136,7 @@ String FhemIP   = "192.168.2.12";                              // ip address of 
 String FhemPort = "8083";                                      // port of fhem web server
 String FhemFmt  = "fhem";                                      // output format for fhem message
 String FhemVarIR = "d_IR";                                     // name of fhem dummy variable to set
-String FhemVarTH = "d_Temp1";                                  // name of fhem dummy variable to set for temp & humidity
+String FhemVarTH = "d_Temp2";                                  // name of fhem dummy variable to set for temp & humidity
 int FhemMsg = 1;                                               // send recieved IR commands to fhem
 int DHTcycle = 60000;                                          // time between DHT measures in ms
 int STATUScycle = 600000;                                      // time between status messages in ms
@@ -226,7 +230,7 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   Serial.println("");
-  Serial.printf("ESP8266 IR Controller (Version %s)\n", Version.c_str());
+  Serial.printf("ESP8266 IR Controller (Version %s)\n", IRVersion.c_str());
   delay(1000);
   
   // set GPIO0 as output (LED)
@@ -256,8 +260,14 @@ void setup() {
   HTTPServer.on("/msg", handle_msg);
   HTTPServer.on("/received", handleReceived);
   HTTPServer.on("/setup", handle_setup);
+  HTTPServer.on("/status", []() {
+    Serial.println("[HTTP ] Connection received: /status");
+    STATUStoFhem();
+    sendHomePage(); // 200
+  });
   HTTPServer.on("/reset", []() {
     Serial.println("[HTTP ] Connection received: /reset");
+    sendHomePage(); // 200
     ESP.reset();
   });
   HTTPServer.on("/", []() {
@@ -397,10 +407,12 @@ void handleReceived() {
   int id = HTTPServer.arg("id").toInt();
 
   if (id == 1 && last_code.containsKey("time"))        sendCodePage(last_code);
+  /*
   else if (id == 2 && last_code_2.containsKey("time")) sendCodePage(last_code_2);
   else if (id == 3 && last_code_3.containsKey("time")) sendCodePage(last_code_3);
   else if (id == 4 && last_code_4.containsKey("time")) sendCodePage(last_code_4);
   else if (id == 5 && last_code_5.containsKey("time")) sendCodePage(last_code_5);
+  */
   else sendHomePage("Code does not exist", "Alert", 2, 404); // 404
 }
 
@@ -429,6 +441,7 @@ String getValue(String data, char separator, int index)
 // ------------------------------------------------------------------------------------------
 String encoding(decode_results *results) {
   String output;
+
   switch (results->decode_type) {
     default:
     case UNKNOWN:      output = "UNKNOWN";            break;
@@ -450,8 +463,9 @@ String encoding(decode_results *results) {
     case DENON:        output = "DENON";              break;
     case COOLIX:       output = "COOLIX";             break;
   }
+
+  if(results->repeat) Serial.println("[IR   ] repeat");
   return output;
-  if (results->repeat) Serial.print("[IR   ] (Repeat)");
 }
 
 // ------------------------------------------------------------------------------------------
@@ -532,7 +546,7 @@ void sendHeader(int httpcode) {
 // ------------------------------------------------------------------------------------------
 void sendFooter() {
   HTTPServer.sendContent("      <div class='row'><div class='col-md-12'><em>" + String(millis()) + "ms uptime</em></div></div>\n");
-  HTTPServer.sendContent("      <div class='row'><div class='col-md-12'><em> Firmware Version " + Version + "</em></div></div>\n");
+  HTTPServer.sendContent("      <div class='row'><div class='col-md-12'><em> Firmware Version " + IRVersion + "</em></div></div>\n");
   HTTPServer.sendContent("    </div>\n");
   HTTPServer.sendContent("  </body>\n");
   HTTPServer.sendContent("</html>\n");
@@ -571,6 +585,7 @@ void sendHomePage(String message, String header, int type, int httpcode) {
   HTTPServer.sendContent("            <tbody>\n");
   if (last_send.containsKey("time"))
     HTTPServer.sendContent("              <tr class='text-uppercase'><td>" + last_send["time"].as<String>() + "</td><td><code>" + last_send["data"].as<String>() + "</code></td><td><code>" + last_send["type"].as<String>() + "</code></td><td><code>" + last_send["len"].as<String>() + "</code></td><td><code>" + last_send["address"].as<String>() + "</code></td></tr>\n");
+  /*
   if (last_send_2.containsKey("time"))
     HTTPServer.sendContent("              <tr class='text-uppercase'><td>" + last_send_2["time"].as<String>() + "</td><td><code>" + last_send_2["data"].as<String>() + "</code></td><td><code>" + last_send_2["type"].as<String>() + "</code></td><td><code>" + last_send_2["len"].as<String>() + "</code></td><td><code>" + last_send_2["address"].as<String>() + "</code></td></tr>\n");
   if (last_send_3.containsKey("time"))
@@ -580,6 +595,8 @@ void sendHomePage(String message, String header, int type, int httpcode) {
   if (last_send_5.containsKey("time"))
     HTTPServer.sendContent("              <tr class='text-uppercase'><td>" + last_send_5["time"].as<String>() + "</td><td><code>" + last_send_5["data"].as<String>() + "</code></td><td><code>" + last_send_5["type"].as<String>() + "</code></td><td><code>" + last_send_5["len"].as<String>() + "</code></td><td><code>" + last_send_5["address"].as<String>() + "</code></td></tr>\n");
   if (!last_send.containsKey("time") && !last_send_2.containsKey("time") && !last_send_3.containsKey("time") && !last_send_4.containsKey("time") && !last_send_5.containsKey("time"))
+  */
+  if (!last_send.containsKey("time"))
     HTTPServer.sendContent("              <tr><td colspan='5' class='text-center'><em>No codes sent</em></td></tr>");
   HTTPServer.sendContent("            </tbody></table>\n");
   HTTPServer.sendContent("          </div></div>\n");
@@ -591,6 +608,7 @@ void sendHomePage(String message, String header, int type, int httpcode) {
   HTTPServer.sendContent("            <tbody>\n");
   if (last_code.containsKey("time"))
     HTTPServer.sendContent("              <tr class='text-uppercase'><td><a href='/received?id=1'>" + last_code["time"].as<String>() + "</a></td><td><code>" + last_code["data"].as<String>() + "</code></td><td><code>" + last_code["encoding"].as<String>() + "</code></td><td><code>" + last_code["bits"].as<String>() + "</code></td><td><code>" + last_code["address"].as<String>() + "</code></td></tr>\n");
+  /*
   if (last_code_2.containsKey("time"))
     HTTPServer.sendContent("              <tr class='text-uppercase'><td><a href='/received?id=2'>" + last_code_2["time"].as<String>() + "</a></td><td><code>" + last_code_2["data"].as<String>() + "</code></td><td><code>" + last_code_2["encoding"].as<String>() + "</code></td><td><code>" + last_code_2["bits"].as<String>() + "</code></td><td><code>" + last_code_2["address"].as<String>() + "</code></td></tr>\n");
   if (last_code_3.containsKey("time"))
@@ -600,6 +618,8 @@ void sendHomePage(String message, String header, int type, int httpcode) {
   if (last_code_5.containsKey("time"))
     HTTPServer.sendContent("              <tr class='text-uppercase'><td><a href='/received?id=5'>" + last_code_5["time"].as<String>() + "</a></td><td><code>" + last_code_5["data"].as<String>() + "</code></td><td><code>" + last_code_5["encoding"].as<String>() + "</code></td><td><code>" + last_code_5["bits"].as<String>() + "</code></td><td><code>" + last_code_5["address"].as<String>() + "</code></td></tr>\n");
   if (!last_code.containsKey("time") && !last_code_2.containsKey("time") && !last_code_3.containsKey("time") && !last_code_4.containsKey("time") && !last_code_5.containsKey("time"))
+  */
+  if (!last_code.containsKey("time"))
     HTTPServer.sendContent("              <tr><td colspan='5' class='text-center'><em>No codes received</em></td></tr>");
   HTTPServer.sendContent("            </tbody></table>\n");
   HTTPServer.sendContent("          </div></div>\n");
@@ -696,6 +716,7 @@ void codeJson(JsonObject &codeData, decode_results *results)
   }
 }
 
+#ifdef DEBUG
 // ------------------------------------------------------------------------------------------
 // Dump out the decode_results structure.
 // ------------------------------------------------------------------------------------------
@@ -799,6 +820,7 @@ void dumpCode(decode_results *results) {
     Serial.println(";");
   }
 }
+#endif
 
 // ------------------------------------------------------------------------------------------
 // Convert string to hex, borrowed from ESPBasic
@@ -870,11 +892,12 @@ void irblast(String type, String dataStr, unsigned int len, int rdelay, int puls
   CountIRsent++;
   Serial.println("[IR   ] Transmission complete");
 
+  /*
   copyJsonSend(last_send_4, last_send_5);
   copyJsonSend(last_send_3, last_send_4);
   copyJsonSend(last_send_2, last_send_3);
   copyJsonSend(last_send, last_send_2);
-
+  */
   last_send["data"] = dataStr;
   last_send["len"] = len;
   last_send["type"] = type;
@@ -911,11 +934,13 @@ void rawblast(JsonArray &raw, int khz, int rdelay, int pulse, int pdelay, int re
   CountIRsent++;
   Serial.println("[IR   ] Transmission complete");
 
+  /*
   copyJsonSend(last_send_4, last_send_5);
   copyJsonSend(last_send_3, last_send_4);
   copyJsonSend(last_send_2, last_send_3);
   copyJsonSend(last_send, last_send_2);
-
+  */
+  
   last_send["data"] = NULL;
   last_send["len"] = raw.size();
   last_send["type"] = "RAW";
@@ -1103,28 +1128,35 @@ void SendHttpCmd(String httpCmd) {
 // main loop
 // ------------------------------------------------------------------------------------------
 void loop() {
-  String tmp;
   static unsigned long DHTlastReadout=0;
   static unsigned long STATUSlastSent=0;
-  HTTPServer.handleClient();
   decode_results  results;                                        // Somewhere to store the results
+
+  HTTPServer.handleClient();
+
   if (getTime) timeClient.update();                               // Update the time
 
   if (irrecv.decode(&results) && !holdReceive) {                  // Grab an IR code
     CountIRreceived++;
     Serial.println("[IR   ] Signal received:");
+#ifdef DEBUG
     fullCode(&results);                                           // Print the singleline value
     dumpCode(&results);                                           // Output the results as source code
+#endif
+    /*
     copyJson(last_code_4, last_code_5);                           // Pass
     copyJson(last_code_3, last_code_4);                           // Pass
     copyJson(last_code_2, last_code_3);                           // Pass
     copyJson(last_code, last_code_2);                             // Pass
+    */
     codeJson(last_code, &results);                                // Store the results
     last_code["time"] = String(timeClient.getFormattedTime());    // Set the new update time
     irrecv.resume();                                              // Prepare for the next value
 
     if (FhemMsg) {                                                // if Fhem Messaging enabled
-      if(last_code["encoding"].as<String>()!="UNKNOWN") {         // reasonable IR code
+      if(results.repeat)
+        Serial.println("[IR   ] repeated code --> no message to Fhem");
+      else if(true || last_code["encoding"].as<String>()!="UNKNOWN") {         // reasonable IR code
         CountIRtransferred++;
         IRtoFhem();                                               // --> send to Fhem
       }
@@ -1139,7 +1171,6 @@ void loop() {
     DHTtoFhem();
     DHTlastReadout=Now;
   }
-
   if(Now-STATUSlastSent>(unsigned long)STATUScycle || STATUSlastSent==0) {
     // send STATUS info if cycle time is over (or never sent before)
     STATUStoFhem();
