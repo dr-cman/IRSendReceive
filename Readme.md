@@ -37,7 +37,7 @@
 
      <cmd>
      /         Homepage with status information
-     /reset     restart IRSendReceive
+     /reset    restart IRSendReceive
      /setup    configure IRSendReceive
                FhemIP=xxx.xxx.xxx.xxx  IP adress of Fhem server  (default 192.168.2.12)
                FhemPort=xxxx           Port number of Fhem server (default 8083)
@@ -52,7 +52,7 @@
      /json     send IR command in json format
      /received retrieve received IR command in json format
                Arguments:  
-               &id=n n=[1..5]   retrieve details of lan n-th received code
+               &id=n n=[1..n]   retrieve details of lan n-th received code
      /update   start OTY firmware update
  
  Huge parts of this program code are taken from the project ESP8266-HTTP-IR-Blaster
