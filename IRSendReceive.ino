@@ -25,10 +25,17 @@
 //   - update of forceSend was missing -> T/H always sent to Fhem
 //   - ststus information about received/sent and transferred IR commands is sent to Fhem dummy variable for IR commands
 //
+// Version 1.2.2: http command /reset added
+//
+// Version 2.0.0: Replacement of JSON based handling of received and sent IR codes + code clean up 
+//   - According to the ArduinoJson documentation DynamicJasoBuffer must not be used for global variables. Consequently 
+//     this construct has been removed and replaced by a simple array of IRcode elements (see source code).
+//
 // http commands
 //   http://xxx.xxx.xxx.xxx<cmd>
 //   <cmd>
 //   /          Homepage with status information
+//   /reset     restart IRSendReceive
 //   /setup     configure IRSendReceive
 //              FhemIP=xxx.xxx.xxx.xxx  IP adress of Fhem server  (default 192.168.2.12)
 //              FhemPort=xxxx           Port number of Fhem server (default 8083)
@@ -50,57 +57,41 @@
 // (https://github.com/mdhiggins/ESP8266-HTTP-IR-Blaster) from Michael Higgins.
 // Thanks for the cool work!
 //
+// Author C. Laloni
 // *******************************************************************************************
 
-// IR support
+// IR support ------------------
 #include <IRremoteESP8266.h>
 #include <IRsend.h>
 #include <IRrecv.h>
 #include <IRutils.h>
 
-// DHT22 support
+// DHT22 support ---------------
 #include <Adafruit_Sensor.h>
 #include <DHT.h>
 #include <DHT_U.h>
 
-// WiFi support
+// WiFi support ----------------
 #include <ESP8266WiFi.h>
 #include <WiFiManager.h>                // https://github.com/tzapu/WiFiManager WiFi Configuration Magic
 #include <ESP8266mDNS.h>                // Useful to access to ESP by hostname.local
 #include <Ticker.h>
 
 #include <ArduinoJson.h>                // json support
+
+// Web Server & Client ---------
 #include <ESP8266WebServer.h>           // needed for web server
 #include <ESP8266HTTPClient.h>          // needed for client functions
 #include <ESP8266HTTPUpdateServer.h>    // needed for OTA updates
 
 #include <NTPClient.h>                  // needed for time information
 
-String IRVersion="1.2.2 " + String(__DATE__) + " " + String(__TIME__);
+// System version
+String IRVersion="2.0.0 " + String(__DATE__) + " " + String(__TIME__);
 
 int port = 80;
 char host_name[40] = "ESP8266IR";
 char port_str[20] = "80";
-
-DynamicJsonBuffer jsonBuffer;
-
-JsonObject& last_code = jsonBuffer.createObject();            // Stores last code
-/*
-JsonObject& last_code_2 = jsonBuffer.createObject();          // Stores 2nd to last code
-JsonObject& last_code_3 = jsonBuffer.createObject();          // Stores 3rd to last code
-JsonObject& last_code_4 = jsonBuffer.createObject();          // Stores 4th to last code
-JsonObject& last_code_5 = jsonBuffer.createObject();          // Stores 5th to last code
-*/
-
-JsonObject& last_send = jsonBuffer.createObject();            // Stores last sent
-/*
-JsonObject& last_send_2 = jsonBuffer.createObject();          // Stores 2nd last sent
-JsonObject& last_send_3 = jsonBuffer.createObject();          // Stores 3rd last sent
-JsonObject& last_send_4 = jsonBuffer.createObject();          // Stores 4th last sent
-JsonObject& last_send_5 = jsonBuffer.createObject();          // Stores 5th last sent
-*/
-
-JsonObject& deviceState = jsonBuffer.createObject();
 
 ESP8266WebServer HTTPServer(port);
 ESP8266HTTPUpdateServer httpUpdater;
@@ -116,22 +107,24 @@ int dhtpin = 2;                                               // DHT22 sensor pi
 IRrecv irrecv(pinr);
 IRsend irsend(pins);
 
-// DHT related variables
+// DHT related variables ------
 DHT_Unified dht(dhtpin, DHT22);
 static float lastTemp=0;
 static float lastHum=0;
 static unsigned long lastSent=0;
 uint32_t delayMS;
 
+// system time ----------------
 const unsigned long resetfrequency = 259200000;                // 72 hours in milliseconds
-int timeOffset = 7200;                                         // Timezone offset in seconds (MESZ)
+int timeOffset = 3600;                                         // Timezone offset in seconds (MESZ)
 const char* poolServerName = "time.nist.gov";
-
 const bool getTime = true;                                     // Set to false to disable querying for the time
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, poolServerName, timeOffset, (int)resetfrequency);
+
 WiFiManager wifiManager;
 
+// Fhem settings -----------
 String FhemIP   = "192.168.2.12";                              // ip address of fhem system
 String FhemPort = "8083";                                      // port of fhem web server
 String FhemFmt  = "fhem";                                      // output format for fhem message
@@ -141,16 +134,36 @@ int FhemMsg = 1;                                               // send recieved 
 int DHTcycle = 60000;                                          // time between DHT measures in ms
 int STATUScycle = 600000;                                      // time between status messages in ms
 
-// OTA related settings
+// OTA related settings -----
 const char* update_path = "/update";
 const char* update_username = "admin";
 const char* update_password = "cman";
 
+// status variables ---------
 int CountIRreceived=0;
 int CountIRsent=0;
 int CountIRtransferred=0;
 
+// ticker to control blinking LED
 Ticker LEDticker;
+
+// type and buffer to store sent/received IR codes
+typedef struct {
+  String type;
+  String data;
+  String bits;
+  String rawbuf;
+  String rawlen;
+  String address;
+  String command;
+  String rec_time;
+} IRcode;
+
+#define MAX_CODES 6
+IRcode Received[MAX_CODES];
+IRcode *LastReceived[MAX_CODES];
+IRcode Sent[MAX_CODES];
+IRcode *LastSent[MAX_CODES];
 
 // ------------------------------------------------------------------------------------------
 // Status LED blinking
@@ -204,7 +217,7 @@ void DHTinit() {
 // ------------------------------------------------------------------------------------------
 void resetReceive() {
   if (holdReceive) {
-    Serial.println("Reenabling receiving");
+    Serial.println("[IR   ] Reenabling receiving");
     irrecv.resume();
     holdReceive = false;
   }
@@ -221,74 +234,6 @@ String ipToString(IPAddress ip)
   return s;
 }
 
-// ------------------------------------------------------------------------------------------
-// Setup web server and IR receiver/blaster
-// ------------------------------------------------------------------------------------------
-void setup() {
-
-  // Initialize serial
-  Serial.begin(115200);
-  delay(1000);
-  Serial.println("");
-  Serial.printf("ESP8266 IR Controller (Version %s)\n", IRVersion.c_str());
-  delay(1000);
-  
-  // set GPIO0 as output (LED)
-  pinMode(ledpin, OUTPUT);
-  digitalWrite(ledpin, LOW);
-  LEDticker.attach(0.5, LEDblink);
-    
-  // establish wlan connection
-  wifiManager.autoConnect("ESP8266 IR Controller");
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.print("\n");
-  LEDoff();
-
-  wifi_set_sleep_type(LIGHT_SLEEP_T);
-
-  Serial.print("[INIT ] Local IP: ");
-  Serial.println(ipToString(WiFi.localIP()));
-
-  if (getTime) timeClient.begin(); // Get the time
-
-  // Configure the server
-  HTTPServer.on("/json", handle_json);
-  HTTPServer.on("/msg", handle_msg);
-  HTTPServer.on("/received", handleReceived);
-  HTTPServer.on("/setup", handle_setup);
-  HTTPServer.on("/status", []() {
-    Serial.println("[HTTP ] Connection received: /status");
-    STATUStoFhem();
-    sendHomePage(); // 200
-  });
-  HTTPServer.on("/reset", []() {
-    Serial.println("[HTTP ] Connection received: /reset");
-    sendHomePage(); // 200
-    ESP.reset();
-  });
-  HTTPServer.on("/", []() {
-    Serial.println("[HTTP ] Connection received: /");
-    sendHomePage(); // 200
-  });
-
-  MDNS.begin(host_name);
-
-  httpUpdater.setup(&HTTPServer, update_path, update_username, update_password);
-  HTTPServer.begin();
-  Serial.println("[INIT ] HTTP Server started on port " + String(port));
-  MDNS.addService("http", "tcp", 80);
-
-  irsend.begin();
-  irrecv.enableIRIn();
-  Serial.println("[INIT ] Ready to send and receive IR signals");
-
-  // init DHT sensor 
-  DHTinit();
-}
 
 // ------------------------------------------------------------------------------------------
 // handle msg
@@ -302,10 +247,10 @@ void handle_msg() {
 
   int len = HTTPServer.arg("length").toInt();
   long address = (HTTPServer.hasArg("address")) ? HTTPServer.arg("address").toInt() : 0;
-  int rdelay = (HTTPServer.hasArg("rdelay")) ? HTTPServer.arg("rdelay").toInt() : 1000;
-  int pulse = (HTTPServer.hasArg("pulse")) ? HTTPServer.arg("pulse").toInt() : 1;
-  int pdelay = (HTTPServer.hasArg("pdelay")) ? HTTPServer.arg("pdelay").toInt() : 100;
-  int repeat = (HTTPServer.hasArg("repeat")) ? HTTPServer.arg("repeat").toInt() : 1;
+  int rdelay   = (HTTPServer.hasArg("rdelay"))  ? HTTPServer.arg("rdelay").toInt()  : 1000;
+  int pulse    = (HTTPServer.hasArg("pulse"))   ? HTTPServer.arg("pulse").toInt()   : 1;
+  int pdelay   = (HTTPServer.hasArg("pdelay"))  ? HTTPServer.arg("pdelay").toInt()  : 100;
+  int repeat   = (HTTPServer.hasArg("repeat"))  ? HTTPServer.arg("repeat").toInt()  : 1;
 
   if (HTTPServer.hasArg("code")) {
     String code = HTTPServer.arg("code");
@@ -406,13 +351,8 @@ void handleReceived() {
   Serial.println("[HTTP ] Connection received: /received");
   int id = HTTPServer.arg("id").toInt();
 
-  if (id == 1 && last_code.containsKey("time"))        sendCodePage(last_code);
-  /*
-  else if (id == 2 && last_code_2.containsKey("time")) sendCodePage(last_code_2);
-  else if (id == 3 && last_code_3.containsKey("time")) sendCodePage(last_code_3);
-  else if (id == 4 && last_code_4.containsKey("time")) sendCodePage(last_code_4);
-  else if (id == 5 && last_code_5.containsKey("time")) sendCodePage(last_code_5);
-  */
+  if(id>0 && id<=MAX_CODES && LastReceived[id-1]->rec_time!="")
+      sendCodePage(LastReceived[id-1]);
   else sendHomePage("Code does not exist", "Alert", 2, 404); // 404
 }
 
@@ -569,6 +509,9 @@ void sendHomePage(String message, String header, int type) {
 }
 
 void sendHomePage(String message, String header, int type, int httpcode) {
+  bool received=false;
+  bool sent=false;
+  
   sendHeader(httpcode);
   if (type == 1)
     HTTPServer.sendContent("      <div class='row'><div class='col-md-12'><div class='alert alert-success'><strong>" + header + "!</strong> " + message + "</div></div></div>\n");
@@ -583,20 +526,12 @@ void sendHomePage(String message, String header, int type, int httpcode) {
   HTTPServer.sendContent("          <table class='table table-striped' style='table-layout: fixed;'>\n");
   HTTPServer.sendContent("            <thead><tr><th>Sent</th><th>Command</th><th>Type</th><th>Length</th><th>Address</th></tr></thead>\n"); //Title
   HTTPServer.sendContent("            <tbody>\n");
-  if (last_send.containsKey("time"))
-    HTTPServer.sendContent("              <tr class='text-uppercase'><td>" + last_send["time"].as<String>() + "</td><td><code>" + last_send["data"].as<String>() + "</code></td><td><code>" + last_send["type"].as<String>() + "</code></td><td><code>" + last_send["len"].as<String>() + "</code></td><td><code>" + last_send["address"].as<String>() + "</code></td></tr>\n");
-  /*
-  if (last_send_2.containsKey("time"))
-    HTTPServer.sendContent("              <tr class='text-uppercase'><td>" + last_send_2["time"].as<String>() + "</td><td><code>" + last_send_2["data"].as<String>() + "</code></td><td><code>" + last_send_2["type"].as<String>() + "</code></td><td><code>" + last_send_2["len"].as<String>() + "</code></td><td><code>" + last_send_2["address"].as<String>() + "</code></td></tr>\n");
-  if (last_send_3.containsKey("time"))
-    HTTPServer.sendContent("              <tr class='text-uppercase'><td>" + last_send_3["time"].as<String>() + "</td><td><code>" + last_send_3["data"].as<String>() + "</code></td><td><code>" + last_send_3["type"].as<String>() + "</code></td><td><code>" + last_send_3["len"].as<String>() + "</code></td><td><code>" + last_send_3["address"].as<String>() + "</code></td></tr>\n");
-  if (last_send_4.containsKey("time"))
-    HTTPServer.sendContent("              <tr class='text-uppercase'><td>" + last_send_4["time"].as<String>() + "</td><td><code>" + last_send_4["data"].as<String>() + "</code></td><td><code>" + last_send_4["type"].as<String>() + "</code></td><td><code>" + last_send_4["len"].as<String>() + "</code></td><td><code>" + last_send_4["address"].as<String>() + "</code></td></tr>\n");
-  if (last_send_5.containsKey("time"))
-    HTTPServer.sendContent("              <tr class='text-uppercase'><td>" + last_send_5["time"].as<String>() + "</td><td><code>" + last_send_5["data"].as<String>() + "</code></td><td><code>" + last_send_5["type"].as<String>() + "</code></td><td><code>" + last_send_5["len"].as<String>() + "</code></td><td><code>" + last_send_5["address"].as<String>() + "</code></td></tr>\n");
-  if (!last_send.containsKey("time") && !last_send_2.containsKey("time") && !last_send_3.containsKey("time") && !last_send_4.containsKey("time") && !last_send_5.containsKey("time"))
-  */
-  if (!last_send.containsKey("time"))
+  for(int i=0; i<MAX_CODES; i++)
+  if (LastSent[i]->rec_time!="") {
+    HTTPServer.sendContent("              <tr class='text-uppercase'><td>" + LastSent[i]->rec_time + "</td><td><code>" + LastSent[i]->data + "</code></td><td><code>" + LastSent[i]->type + "</code></td><td><code>" + LastSent[i]->bits + "</code></td><td><code>" + LastSent[i]->address + "</code></td></tr>\n");
+    sent=true;
+  }
+  if (!sent)
     HTTPServer.sendContent("              <tr><td colspan='5' class='text-center'><em>No codes sent</em></td></tr>");
   HTTPServer.sendContent("            </tbody></table>\n");
   HTTPServer.sendContent("          </div></div>\n");
@@ -604,22 +539,14 @@ void sendHomePage(String message, String header, int type, int httpcode) {
   HTTPServer.sendContent("        <div class='col-md-12'>\n");
   HTTPServer.sendContent("          <h3>Codes Received</h3>\n");
   HTTPServer.sendContent("          <table class='table table-striped' style='table-layout: fixed;'>\n");
-  HTTPServer.sendContent("            <thead><tr><th>Time Sent</th><th>Command</th><th>Type</th><th>Length</th><th>Address</th></tr></thead>\n"); //Title
+  HTTPServer.sendContent("            <thead><tr><th>Time Received</th><th>Command</th><th>Type</th><th>Length</th><th>Address</th></tr></thead>\n"); //Title
   HTTPServer.sendContent("            <tbody>\n");
-  if (last_code.containsKey("time"))
-    HTTPServer.sendContent("              <tr class='text-uppercase'><td><a href='/received?id=1'>" + last_code["time"].as<String>() + "</a></td><td><code>" + last_code["data"].as<String>() + "</code></td><td><code>" + last_code["encoding"].as<String>() + "</code></td><td><code>" + last_code["bits"].as<String>() + "</code></td><td><code>" + last_code["address"].as<String>() + "</code></td></tr>\n");
-  /*
-  if (last_code_2.containsKey("time"))
-    HTTPServer.sendContent("              <tr class='text-uppercase'><td><a href='/received?id=2'>" + last_code_2["time"].as<String>() + "</a></td><td><code>" + last_code_2["data"].as<String>() + "</code></td><td><code>" + last_code_2["encoding"].as<String>() + "</code></td><td><code>" + last_code_2["bits"].as<String>() + "</code></td><td><code>" + last_code_2["address"].as<String>() + "</code></td></tr>\n");
-  if (last_code_3.containsKey("time"))
-    HTTPServer.sendContent("              <tr class='text-uppercase'><td><a href='/received?id=3'>" + last_code_3["time"].as<String>() + "</a></td><td><code>" + last_code_3["data"].as<String>() + "</code></td><td><code>" + last_code_3["encoding"].as<String>() + "</code></td><td><code>" + last_code_3["bits"].as<String>() + "</code></td><td><code>" + last_code_3["address"].as<String>() + "</code></td></tr>\n");
-  if (last_code_4.containsKey("time"))
-    HTTPServer.sendContent("              <tr class='text-uppercase'><td><a href='/received?id=4'>" + last_code_4["time"].as<String>() + "</a></td><td><code>" + last_code_4["data"].as<String>() + "</code></td><td><code>" + last_code_4["encoding"].as<String>() + "</code></td><td><code>" + last_code_4["bits"].as<String>() + "</code></td><td><code>" + last_code_4["address"].as<String>() + "</code></td></tr>\n");
-  if (last_code_5.containsKey("time"))
-    HTTPServer.sendContent("              <tr class='text-uppercase'><td><a href='/received?id=5'>" + last_code_5["time"].as<String>() + "</a></td><td><code>" + last_code_5["data"].as<String>() + "</code></td><td><code>" + last_code_5["encoding"].as<String>() + "</code></td><td><code>" + last_code_5["bits"].as<String>() + "</code></td><td><code>" + last_code_5["address"].as<String>() + "</code></td></tr>\n");
-  if (!last_code.containsKey("time") && !last_code_2.containsKey("time") && !last_code_3.containsKey("time") && !last_code_4.containsKey("time") && !last_code_5.containsKey("time"))
-  */
-  if (!last_code.containsKey("time"))
+  for(int i=0; i<MAX_CODES; i++)
+  if (LastReceived[i]->rec_time!="") {
+    HTTPServer.sendContent("              <tr class='text-uppercase'><td><a href='/received?id=" + String(i+1) + "'>" + LastReceived[i]->rec_time + "</a></td><td><code>" + LastReceived[i]->data + "</code></td><td><code>" + LastReceived[i]->type + "</code></td><td><code>" + LastReceived[i]->bits + "</code></td><td><code>" + LastReceived[i]->address + "</code></td></tr>\n");
+    received=true;
+  }
+  if (!received)
     HTTPServer.sendContent("              <tr><td colspan='5' class='text-center'><em>No codes received</em></td></tr>");
   HTTPServer.sendContent("            </tbody></table>\n");
   HTTPServer.sendContent("          </div></div>\n");
@@ -642,47 +569,47 @@ void sendHomePage(String message, String header, int type, int httpcode) {
 // ------------------------------------------------------------------------------------------
 // Stream code page HTML
 // ------------------------------------------------------------------------------------------
-void sendCodePage(JsonObject& selCode) {
+void sendCodePage(IRcode *selCode) {
   sendCodePage(selCode, 200);
 }
 
-void sendCodePage(JsonObject& selCode, int httpcode) {
+void sendCodePage(IRcode *selCode, int httpcode) {
   sendHeader(httpcode);
   HTTPServer.sendContent("      <div class='row'>\n");
   HTTPServer.sendContent("        <div class='col-md-12'>\n");
-  HTTPServer.sendContent("          <h2><span class='label label-success'>" + selCode["data"].as<String>() + ":" + selCode["encoding"].as<String>() + ":" + selCode["bits"].as<String>() + "</span></h2><br/>\n");
+  HTTPServer.sendContent("          <h2><span class='label label-success'>" + selCode->data + ":" + selCode->type + ":" + selCode->bits + "</span></h2><br/>\n");
   HTTPServer.sendContent("          <dl class='dl-horizontal'>\n");
   HTTPServer.sendContent("            <dt>Data</dt>\n");
-  HTTPServer.sendContent("            <dd><code>" + selCode["data"].as<String>()  + "</code></dd></dl>\n");
+  HTTPServer.sendContent("            <dd><code>" + selCode->data  + "</code></dd></dl>\n");
   HTTPServer.sendContent("          <dl class='dl-horizontal'>\n");
   HTTPServer.sendContent("            <dt>Type</dt>\n");
-  HTTPServer.sendContent("            <dd><code>" + selCode["encoding"].as<String>()  + "</code></dd></dl>\n");
+  HTTPServer.sendContent("            <dd><code>" + selCode->type  + "</code></dd></dl>\n");
   HTTPServer.sendContent("          <dl class='dl-horizontal'>\n");
   HTTPServer.sendContent("            <dt>Length</dt>\n");
-  HTTPServer.sendContent("            <dd><code>" + selCode["bits"].as<String>()  + "</code></dd></dl>\n");
+  HTTPServer.sendContent("            <dd><code>" + selCode->bits  + "</code></dd></dl>\n");
   HTTPServer.sendContent("          <dl class='dl-horizontal'>\n");
   HTTPServer.sendContent("            <dt>Address</dt>\n");
-  HTTPServer.sendContent("            <dd><code>" + selCode["address"].as<String>()  + "</code></dd></dl>\n");
+  HTTPServer.sendContent("            <dd><code>" + selCode->address  + "</code></dd></dl>\n");
   HTTPServer.sendContent("          <dl class='dl-horizontal'>\n");
   HTTPServer.sendContent("            <dt>Raw</dt>\n");
-  HTTPServer.sendContent("            <dd><code>" + selCode["uint16_t"].as<String>()  + "</code></dd></dl>\n");
+  HTTPServer.sendContent("            <dd><code>" + selCode->rawbuf  + "</code></dd></dl>\n");
   HTTPServer.sendContent("        </div></div>\n");
   HTTPServer.sendContent("      <div class='row'>\n");
-  if (selCode["encoding"] == "UNKNOWN") {
+  if (selCode->type == "UNKNOWN") {
     HTTPServer.sendContent("      <div class='row'>\n");
     HTTPServer.sendContent("        <div class='col-md-12'>\n");
     HTTPServer.sendContent("          <ul class='list-unstyled'>\n");
     HTTPServer.sendContent("            <li>Local IP <span class='label label-default'>JSON</span></li>\n");
-    HTTPServer.sendContent("            <li><pre>http://" + ipToString(WiFi.localIP()) + ":" + String(port) + "/json?plain=[{'data':[" + selCode["uint16_t"].as<String>() + "], 'type':'raw', 'khz':38}]</pre></li>\n");
+    HTTPServer.sendContent("            <li><pre>http://" + ipToString(WiFi.localIP()) + ":" + String(port) + "/json?plain=[{'data':[" + selCode->rawbuf + "], 'type':'raw', 'khz':38}]</pre></li>\n");
   } else {
     HTTPServer.sendContent("      <div class='row'>\n");
     HTTPServer.sendContent("        <div class='col-md-12'>\n");
     HTTPServer.sendContent("          <ul class='list-unstyled'>\n");
     HTTPServer.sendContent("            <li>Local IP <span class='label label-default'>MSG</span></li>\n");
-    HTTPServer.sendContent("            <li><pre>http://" + ipToString(WiFi.localIP()) + ":" + String(port) + "/msg?code=" + selCode["data"].as<String>() + ":" + selCode["encoding"].as<String>() + ":" + selCode["bits"].as<String>() + "</pre></li>\n");
+    HTTPServer.sendContent("            <li><pre>http://" + ipToString(WiFi.localIP()) + ":" + String(port) + "/msg?code=" + selCode->data + ":" + selCode->type + ":" + selCode->bits + "</pre></li>\n");
     HTTPServer.sendContent("          <ul class='list-unstyled'>\n");
     HTTPServer.sendContent("            <li>Local IP <span class='label label-default'>JSON</span></li>\n");
-    HTTPServer.sendContent("            <li><pre>http://" + ipToString(WiFi.localIP()) + ":" + String(port) + "/json?plain=[{'data':'" + selCode["data"].as<String>() + "', 'type':'" + selCode["encoding"].as<String>() + "', 'length':" + selCode["bits"].as<String>() + "}]</pre></li>\n");
+    HTTPServer.sendContent("            <li><pre>http://" + ipToString(WiFi.localIP()) + ":" + String(port) + "/json?plain=[{'data':'" + selCode->data + "', 'type':'" + selCode->type + "', 'length':" + selCode->bits + "}]</pre></li>\n");
   }
   HTTPServer.sendContent("        </div>\n");
   HTTPServer.sendContent("     </div>\n");
@@ -690,14 +617,14 @@ void sendCodePage(JsonObject& selCode, int httpcode) {
 }
 
 // ------------------------------------------------------------------------------------------
-// Code to JsonObject
+// convert received code to IRcode type
 // ------------------------------------------------------------------------------------------
-void codeJson(JsonObject &codeData, decode_results *results)
+void codeIRcode(IRcode *codeData, decode_results *results)
 {
-  codeData["data"] = Uint64toString(results->value, 16);
-  codeData["encoding"] = encoding(results);
-  codeData["bits"] = results->bits;
-  codeData["rawlen"] = results->rawlen - 1;
+  codeData->data = Uint64toString(results->value, 16);
+  codeData->type = encoding(results);
+  codeData->bits = String(results->bits);
+  codeData->rawlen = String(results->rawlen - 1);
   String r = "";
   for (uint16_t i = 1; i < results->rawlen; i++) {
     r += results->rawbuf[i] * RAWTICK;
@@ -705,14 +632,14 @@ void codeJson(JsonObject &codeData, decode_results *results)
       r += ",";                           // ',' not needed on last one
     //if (!(i & 1)) r += " ";
   }
-  codeData["uint16_t"] = r;
+  codeData->rawbuf = r;
 
   if (results->decode_type != UNKNOWN) {
-    codeData["address"] = "0x" + String(results->address, HEX);
-    codeData["command"] = "0x" + String(results->command, HEX);
+    codeData->address = "0x" + String(results->address, HEX);
+    codeData->command = "0x" + String(results->command, HEX);
   } else {
-    codeData["address"] = "0x";
-    codeData["command"] = "0x";
+    codeData->address = "0x";
+    codeData->command = "0x";
   }
 }
 
@@ -863,6 +790,7 @@ void irblast(String type, String dataStr, unsigned int len, int rdelay, int puls
   for (int r = 0; r < repeat; r++) {
     // Pulse Loop
     for (int p = 0; p < pulse; p++) {
+      Serial.print("[IR   ] ");
       Serial.print(data, HEX);
       Serial.print(":");
       Serial.print(type);
@@ -892,17 +820,19 @@ void irblast(String type, String dataStr, unsigned int len, int rdelay, int puls
   CountIRsent++;
   Serial.println("[IR   ] Transmission complete");
 
-  /*
-  copyJsonSend(last_send_4, last_send_5);
-  copyJsonSend(last_send_3, last_send_4);
-  copyJsonSend(last_send_2, last_send_3);
-  copyJsonSend(last_send, last_send_2);
-  */
-  last_send["data"] = dataStr;
-  last_send["len"] = len;
-  last_send["type"] = type;
-  last_send["address"] = address;
-  last_send["time"] = String(timeClient.getFormattedTime());
+  // shift LastReceived IRcodes and copy last_code as first one
+  IRcode *tmp=LastSent[MAX_CODES-1];
+  for(int i=MAX_CODES-1; i>0; i--)
+    LastSent[i]=LastSent[i-1];
+  LastSent[0]=tmp;  
+
+  LastSent[0]->data = dataStr;
+  LastSent[0]->bits = String(len);
+  LastSent[0]->type = type;
+  LastSent[0]->address = String(address);
+  LastSent[0]->command = "0";
+  LastSent[0]->rawlen = "0";
+  LastSent[0]->rec_time = String(timeClient.getFormattedTime());
 
   resetReceive();
 }
@@ -934,52 +864,42 @@ void rawblast(JsonArray &raw, int khz, int rdelay, int pulse, int pdelay, int re
   CountIRsent++;
   Serial.println("[IR   ] Transmission complete");
 
-  /*
-  copyJsonSend(last_send_4, last_send_5);
-  copyJsonSend(last_send_3, last_send_4);
-  copyJsonSend(last_send_2, last_send_3);
-  copyJsonSend(last_send, last_send_2);
-  */
-  
-  last_send["data"] = NULL;
-  last_send["len"] = raw.size();
-  last_send["type"] = "RAW";
-  last_send["address"] = 0;
-  last_send["time"] = String(timeClient.getFormattedTime());
+  // shift LastReceived IRcodes and copy last_code as first one
+  IRcode *tmp=LastSent[MAX_CODES-1];
+  for(int i=MAX_CODES-1; i>0; i--)
+    LastSent[i]=LastSent[i-1];
+  LastSent[0]=tmp;  
+
+  LastSent[0]->data = "";
+  LastSent[0]->type = "RAW";
+  LastSent[0]->bits = String(raw.size());
+  LastSent[0]->address = "0";
+  LastSent[0]->command = "0";
+  LastSent[0]->rawlen = "0";
+  LastSent[0]->rec_time = String(timeClient.getFormattedTime());
+  LastSent[0]->rawbuf = "";
 
   resetReceive();
 }
 
 // ------------------------------------------------------------------------------------------
-// copy received IR code info from one Jsaon object to another
+// copy received IR code into history buffer
 // ------------------------------------------------------------------------------------------
-void copyJson(JsonObject& j1, JsonObject& j2) {
-  if (j1.containsKey("data"))     j2["data"]     = j1["data"];     else j2["data"]     = NULL;
-  if (j1.containsKey("encoding")) j2["encoding"] = j1["encoding"]; else j2["encoding"] = "";
-  if (j1.containsKey("bits"))     j2["bits"]     = j1["bits"];     else j2["bits"]     = 0;
-  if (j1.containsKey("address"))  j2["address"]  = j1["address"];  else j2["address"]  = 0;
-  if (j1.containsKey("command"))  j2["command"]  = j1["command"];  else j2["command"]  = 0;
-  if (j1.containsKey("rawlen"))   j2["rawlen"]   = j1["rawlen"];   else j2["rawlen"]   = 0;
-  if (j1.containsKey("time"))     j2["time"]     = j1["time"];
-  if (j1.containsKey("uint16_t")) j2["uint16_t"] = j1["uint16_t"]; else j2["uint16_t"] = NULL;
+void copyIRcode(IRcode *from, IRcode *to) {
+  to->data    = from->data;
+  to->type    = from->type;
+  to->bits    = from->bits;
+  to->address = from->address;
+  to->command = from->command;
+  to->rawlen  = from->rawlen;
+  to->rec_time= from->rec_time;
+  to->rawbuf  = from->rawbuf;
 }
 
 // ------------------------------------------------------------------------------------------
-// copy sent IR code info from one Jsaon object to another
+// send received IR code info via http to a fhem web server
 // ------------------------------------------------------------------------------------------
-void copyJsonSend(JsonObject& j1, JsonObject& j2) {
-  if (j1.containsKey("data"))     j2["data"]     = j1["data"];     else j2["data"]     = NULL;
-  if (j1.containsKey("type"))     j2["type"]     = j1["type"];     else j2["type"]     = "";
-  if (j1.containsKey("len"))      j2["len"]      = j1["len"];      else j2["len"]      = 0;
-  if (j1.containsKey("address"))  j2["address"]  = j1["address"];  else j2["address"]  = 0;
-  if (j1.containsKey("rawlen"))   j2["rawlen"]   = j1["rawlen"];   else j2["rawlen"]   = 0;
-  if (j1.containsKey("time"))     j2["time"]     = j1["time"];
-}
-
-// ------------------------------------------------------------------------------------------
-// send IR code info via http to a fhem web server
-// ------------------------------------------------------------------------------------------
-void IRtoFhem() {
+void IRtoFhem(IRcode *last_code) {
   String httpCmd;
 
   digitalWrite(ledpin, HIGH);         // switch on Status LED for two seconds
@@ -989,31 +909,31 @@ void IRtoFhem() {
 
   if(FhemFmt!="fhem") {
     httpCmd += "[{";
-    if (last_code["encoding"] != "UNKNOWN") {
-      httpCmd += "'type':'"    + last_code["encoding"].as<String>() + "',%20";
-      httpCmd += "'length':"   + last_code["bits"].as<String>()     + "',%20";
-      httpCmd += "'address':'" + last_code["address"].as<String>()  + "',%20";
-      httpCmd += "'command':'" + last_code["command"].as<String>()  + "',%20";
-      httpCmd += "'data':'"    + last_code["data"].as<String>()     + "'}]&XHR=1";
+    if (last_code->type != "UNKNOWN") {
+      httpCmd += "'type':'"    + last_code->type     + "',%20";
+      httpCmd += "'length':"   + last_code->bits     + "',%20";
+      httpCmd += "'address':'" + last_code->address  + "',%20";
+      httpCmd += "'command':'" + last_code->command  + "',%20";
+      httpCmd += "'data':'"    + last_code->data     + "'}]&XHR=1";
     } else {
       httpCmd += "'type':'RAW',%20";
-      httpCmd += "'data':'"    + last_code["data"].as<String>()     + "',%20";
-      httpCmd += "'rawlenh':"   + last_code["rawlen"].as<String>()   + "',%20";
-      httpCmd += "'rawbuf':'"    + last_code["uint16_t"].as<String>() + "'}]&XHR=1";
+      httpCmd += "'data':'"    + last_code->data   + "',%20";
+      httpCmd += "'rawlen':"   + last_code->rawlen + "',%20";
+      httpCmd += "'rawbuf':'"  + last_code->rawbuf + "'}]&XHR=1";
     }
   } else {
     // send in a format suited for fhem
-    if (last_code["encoding"] != "UNKNOWN") {
-      httpCmd += "type:%20"    + last_code["encoding"].as<String>() + "%20";
-      httpCmd += "length:%20"  + last_code["bits"].as<String>()     + "%20";
-      httpCmd += "address:%20" + last_code["address"].as<String>()  + "%20";
-      httpCmd += "command:%20" + last_code["command"].as<String>()  + "%20";
-      httpCmd += "data:%20"    + last_code["data"].as<String>()     + "&XHR=1";
+    if (last_code->type != "UNKNOWN") {
+      httpCmd += "type:%20"    + last_code->type     + "%20";
+      httpCmd += "length:%20"  + last_code->bits     + "%20";
+      httpCmd += "address:%20" + last_code->address  + "%20";
+      httpCmd += "command:%20" + last_code->command  + "%20";
+      httpCmd += "data:%20"    + last_code->data     + "&XHR=1";
     } else {
       httpCmd += "type:%20RAW%20";
-      httpCmd += "data:%20"    + last_code["data"].as<String>()     + "%20";
-      httpCmd += "rawlen:%20"  + last_code["rawlen"].as<String>()   + "%20";
-      httpCmd += "rawbuf:%20"    + last_code["uint16_t"].as<String>() + "&XHR=1";
+      httpCmd += "data:%20"    + last_code->data   + "%20";
+      httpCmd += "rawlen:%20"  + last_code->rawlen + "%20";
+      httpCmd += "rawbuf:%20"  + last_code->rawbuf + "&XHR=1";
     }
   }
 
@@ -1124,13 +1044,92 @@ void SendHttpCmd(String httpCmd) {
   http.end();
 }
 
-// ------------------------------------------------------------------------------------------
+// ******************************************************************************************
+// Setup web server, IR receiver/blaster and DHT sensor
+// ******************************************************************************************
+void setup() {
+
+  // init buffers for sent/received IR codes
+  for(int i=0; i<MAX_CODES; i++) {
+    Received[i].rec_time="";
+    LastReceived[i]=&(Received[i]);
+    
+    Sent[i].rec_time="";
+    LastSent[i]=&(Sent[i]);
+  }
+  
+  // Initialize serial
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("");
+  Serial.printf("ESP8266 IR Controller (Version %s)\n", IRVersion.c_str());
+  delay(1000);
+  
+  // set GPIO0 as output (LED)
+  pinMode(ledpin, OUTPUT);
+  digitalWrite(ledpin, LOW);
+  LEDticker.attach(0.5, LEDblink);
+    
+  // establish wlan connection
+  wifiManager.autoConnect("ESP8266 IR Controller");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.print("\n");
+  LEDoff();
+
+  wifi_set_sleep_type(LIGHT_SLEEP_T);
+
+  Serial.print("[INIT ] Local IP: ");
+  Serial.println(ipToString(WiFi.localIP()));
+
+  if (getTime) timeClient.begin(); // Get the time
+
+  // Configure the server
+  HTTPServer.on("/json", handle_json);
+  HTTPServer.on("/msg", handle_msg);
+  HTTPServer.on("/received", handleReceived);
+  HTTPServer.on("/setup", handle_setup);
+  HTTPServer.on("/status", []() {
+    Serial.println("[HTTP ] Connection received: /status");
+    STATUStoFhem();
+    sendHomePage(); // 200
+  });
+  HTTPServer.on("/reset", []() {
+    Serial.println("[HTTP ] Connection received: /reset");
+    sendHomePage(); // 200
+    ESP.reset();
+  });
+  HTTPServer.on("/", []() {
+    Serial.println("[HTTP ] Connection received: /");
+    sendHomePage(); // 200
+  });
+
+  MDNS.begin(host_name);
+
+  httpUpdater.setup(&HTTPServer, update_path, update_username, update_password);
+  HTTPServer.begin();
+  Serial.println("[INIT ] HTTP Server started on port " + String(port));
+  MDNS.addService("http", "tcp", 80);
+
+  irsend.begin();
+  irrecv.enableIRIn();
+  Serial.println("[INIT ] Ready to send and receive IR signals");
+
+  // init DHT sensor 
+  DHTinit();
+}
+
+// ******************************************************************************************
 // main loop
-// ------------------------------------------------------------------------------------------
+// ******************************************************************************************
 void loop() {
   static unsigned long DHTlastReadout=0;
   static unsigned long STATUSlastSent=0;
   decode_results  results;                                        // Somewhere to store the results
+  IRcode last_code;
 
   HTTPServer.handleClient();
 
@@ -1143,25 +1142,28 @@ void loop() {
     fullCode(&results);                                           // Print the singleline value
     dumpCode(&results);                                           // Output the results as source code
 #endif
-    /*
-    copyJson(last_code_4, last_code_5);                           // Pass
-    copyJson(last_code_3, last_code_4);                           // Pass
-    copyJson(last_code_2, last_code_3);                           // Pass
-    copyJson(last_code, last_code_2);                             // Pass
-    */
-    codeJson(last_code, &results);                                // Store the results
-    last_code["time"] = String(timeClient.getFormattedTime());    // Set the new update time
+    codeIRcode(&last_code, &results);                             // Store the results
+    last_code.rec_time = String(timeClient.getFormattedTime());   // Set the new update time
     irrecv.resume();                                              // Prepare for the next value
 
-    if (FhemMsg) {                                                // if Fhem Messaging enabled
-      if(results.repeat)
-        Serial.println("[IR   ] repeated code --> no message to Fhem");
-      else if(true || last_code["encoding"].as<String>()!="UNKNOWN") {         // reasonable IR code
-        CountIRtransferred++;
-        IRtoFhem();                                               // --> send to Fhem
+    if(results.repeat)
+      Serial.println("[IR   ] repeated code --> ignore");
+    else {
+      // shift LastReceived IRcodes and copy last_code as first one
+      IRcode *tmp=LastReceived[MAX_CODES-1];
+      for(int i=MAX_CODES-1; i>0; i--)
+        LastReceived[i]=LastReceived[i-1];
+      LastReceived[0]=tmp;  
+      copyIRcode(&last_code, LastReceived[0]);
+    
+      if (FhemMsg) {                                                // if Fhem Messaging enabled
+        if(last_code.type!="UNKNOWN") {                             // reasonable IR code
+          CountIRtransferred++;
+          IRtoFhem(&last_code);                                     // --> send to Fhem
+        }
+        else                                                        // skip otherwise
+          Serial.println("[IR   ] UNKNOWN code --> no message to Fhem");
       }
-      else                                                        // skip otherwise
-        Serial.println("[IR   ] UNKNOWN code --> no message to Fhem");
     }
   }
 
