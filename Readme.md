@@ -8,7 +8,7 @@
    - network configuration via WiFi manager
    - receiving IR codes from IR remote controls via an IR receiver (e.g. TSOP3123) at GPIO 14
    - sending IR codes using IR transmitter diodes connected to GPIO 4
-   - forwarding of received IR codes to Fhem sevrer via http to set a configurable dummy variable
+   - forwarding of received IR codes to Fhem server via http to set a configurable dummy variable
    - over the air update (OTA)
 
  ### Version 1.1.0: status led added (using ticker)
