@@ -25,12 +25,19 @@
    - update of forceSend was missing -> T/H always sent to Fhem
    - status information about received/sent and transferred IR commands is sent to Fhem dummy variable for IR commands
 
+### Version 1.2.2: http command /reset added
+
+### Version 2.0.0: Replacement of JSON based handling of received and sent IR codes + code clean up 
+   - According to the ArduinoJson documentation DynamicJasoBuffer must not be used for global variables. Consequently 
+     this construct has been removed and replaced by a simple array of IRcode elements (see source code).
+
 ### http commands
 
      http://xxx.xxx.xxx.xxx<cmd>
 
      <cmd>
      /         Homepage with status information
+     /reset     restart IRSendReceive
      /setup    configure IRSendReceive
                FhemIP=xxx.xxx.xxx.xxx  IP adress of Fhem server  (default 192.168.2.12)
                FhemPort=xxxx           Port number of Fhem server (default 8083)
